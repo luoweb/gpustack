@@ -16,7 +16,7 @@ from gpustack.utils import platform
 from gpustack.utils.network import get_first_non_loopback_ip
 from gpustack.client import ClientSet
 from gpustack.logging import setup_logging
-from gpustack.utils.signal import add_signal_handlers_in_loop
+from gpustack.utils.process import add_signal_handlers_in_loop
 from gpustack.utils.task import run_periodically_in_thread
 from gpustack.worker.logs import LogOptionsDep
 from gpustack.worker.serve_manager import ServeManager
@@ -204,24 +204,32 @@ class Worker:
         instances so they can be recreated with the new worker IP.
         """
 
+        worker = None
+        workers = self._clientset.workers.list(params={"name": self._worker_name})
+        if workers is not None and len(workers.items) != 0:
+            worker = workers.items[0]
+
         current_ip = get_first_non_loopback_ip()
         if current_ip != self._worker_ip:
             logger.info(f"Worker IP changed from {self._worker_ip} to {current_ip}")
-            self._worker_ip = current_ip
-            self._worker_manager._worker_ip = current_ip
-            self._exporter._worker_ip = current_ip
-
-            workers = self._clientset.workers.list(params={"name": self._worker_name})
-
-            if workers is None or len(workers.items) == 0:
+            if worker is None:
                 raise Exception(f"Worker {self._worker_name} not found")
 
-            worker = workers.items[0]
-            worker_update: WorkerUpdate = WorkerUpdate.model_validate(worker)
-            worker_update.ip = current_ip
-            self._clientset.workers.update(worker.id, worker_update)
+            self.update_worker_ip(worker, current_ip)
+        elif worker and current_ip != worker.ip:
+            logger.info(f"Worker IP changed from {worker.ip} to {current_ip}")
+            self.update_worker_ip(worker, current_ip)
 
-            for instance in self._clientset.model_instances.list(
-                params={"worker_id": worker.id}
-            ).items:
-                self._clientset.model_instances.delete(instance.id)
+    def update_worker_ip(self, worker, current_ip: str):
+        self._worker_ip = current_ip
+        self._worker_manager._worker_ip = current_ip
+        self._exporter._worker_ip = current_ip
+
+        worker_update: WorkerUpdate = WorkerUpdate.model_validate(worker)
+        worker_update.ip = current_ip
+        self._clientset.workers.update(worker.id, worker_update)
+
+        for instance in self._clientset.model_instances.list(
+            params={"worker_id": worker.id}
+        ).items:
+            self._clientset.model_instances.delete(instance.id)
