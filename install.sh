@@ -18,9 +18,6 @@ set -o noglob
 #     The package spec to install. Defaults to "gpustack".
 #     It supports PYPI package names, git URLs, and local paths.
 #
-#   - INSTALL_PRE_RELEASE
-#     If set to 1 will install pre-release packages.
-#
 #   - INSTALL_INDEX_URL
 #     Base URL of the Python Package Index.
 #
@@ -31,7 +28,6 @@ set -o noglob
 #     If set to 1 will skip the build dependencies.
 
 INSTALL_PACKAGE_SPEC="${INSTALL_PACKAGE_SPEC:-}"
-INSTALL_PRE_RELEASE="${INSTALL_PRE_RELEASE:-0}"
 INSTALL_INDEX_URL="${INSTALL_INDEX_URL:-}"
 INSTALL_SKIP_POST_CHECK="${INSTALL_SKIP_POST_CHECK:-0}"
 INSTALL_SKIP_BUILD_DEPENDENCIES="${INSTALL_SKIP_BUILD_DEPENDENCIES:-0}"
@@ -191,15 +187,16 @@ check_python_tools() {
     elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "rocky" ] ; then
       $SUDO yum install -y python3
     elif [ "$OS" = "macos" ]; then
-      brew install python
+      brew install python@3.12
     else
       fatal "Unsupported OS for automatic Python installation. Please install Python3 manually."
     fi
   fi
 
   PYTHON_VERSION=$(python3 -c "import sys; print(sys.version_info.major * 10 + sys.version_info.minor)")
-  if [ "$PYTHON_VERSION" -lt 40 ]; then
-    fatal "Python version is less than 3.10. Please upgrade Python to at least version 3.10."
+  CURRENT_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+  if [ "$PYTHON_VERSION" -lt 40 ] || [ "$PYTHON_VERSION" -ge 43 ]; then
+    fatal "Python version $CURRENT_VERSION is not supported. Please use Python 3.10, 3.11, or 3.12."
   fi
 
   PYTHON_STDLIB_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['stdlib'])")
@@ -224,14 +221,12 @@ check_python_tools() {
       python3 -m ensurepip --upgrade
     fi
 
-    PIP_PYTHON_VERSION=$(pip3 -V | grep -Eo 'python [0-9]+\.[0-9]+' | head -n 1 | awk '{print $2}' | awk -F. '{print $1 * 10 + $2}')
+    PIP_PYTHON_VERSION_READABLE=$(pip3 -V | grep -Eo 'python [0-9]+\.[0-9]+' | head -n 1 | awk '{print $2}')
+    PIP_PYTHON_VERSION=$(echo "$PIP_PYTHON_VERSION_READABLE" | awk -F. '{print $1 * 10 + $2}')
     if [ "$PIP_PYTHON_VERSION" -lt 40 ]; then
-      fatal "Python version for pip3 is less than 3.10. Please upgrade pip3 to be associated with at least Python 3.10."
+      fatal "Python version for pip3 is $PIP_PYTHON_VERSION_READABLE which is not supported. Please use Python 3.10, 3.11, or 3.12."
     fi
   fi
-
-
-  PYTHONPATH=$(python3 -c 'import site, sys; print(":".join(sys.path + [site.getusersitepackages()]))')
 
   if ! command -v pipx > /dev/null 2>&1; then
     info "Pipx could not be found. Attempting to install..."
@@ -246,13 +241,17 @@ check_python_tools() {
     else
       fatal "Unsupported OS for automatic pipx installation. Please install pipx manually."
     fi
-    USER_BASE_BIN=$(python3 -m site --user-base)/bin
-    export PATH="$USER_BASE_BIN:$PATH"
-    pipx ensurepath --force
 
-    PIPX_BIN_DIR=$(pipx environment --value PIPX_BIN_DIR)
-    export PATH="$PIPX_BIN_DIR:$PATH"
+    # In case pipx installation causes python3 PATH changes (e.g., brew link), re-evaluate once.
+    check_python_tools
   fi
+
+  USER_BASE_BIN=$(python3 -m site --user-base)/bin
+  export PATH="$USER_BASE_BIN:$PATH"
+  pipx ensurepath --force
+
+  PIPX_BIN_DIR=$(pipx environment --value PIPX_BIN_DIR)
+  export PATH="$PIPX_BIN_DIR:$PATH"
 }
 
 # Function to install dependencies
@@ -516,6 +515,13 @@ check_service() {
 
 # Function to create uninstall script
 create_uninstall_script() {
+  PYTHON_BIN="python3"
+  PIPX_PYTHON_PATH=$(pipx environment --value PIPX_DEFAULT_PYTHON)
+  if [ -n "$PIPX_PYTHON_PATH" ]; then
+    PYTHON_BIN="$PIPX_PYTHON_PATH"
+  fi
+  PYTHONPATH=$("$PYTHON_BIN" -c 'import site, sys; print(":".join(sys.path + [site.getusersitepackages()]))')
+
   $SUDO mkdir -p /var/lib/gpustack
   $SUDO tee /var/lib/gpustack/uninstall.sh > /dev/null <<EOF
 #!/bin/bash
@@ -549,11 +555,6 @@ install_gpustack() {
   fi
 
   install_args=""
-  if [ "$INSTALL_PRE_RELEASE" -eq 1 ]; then
-    # shellcheck disable=SC2089
-    install_args="--pip-args='--pre'"
-  fi
-
   if [ -n "$INSTALL_INDEX_URL" ]; then
     install_args="--index-url $INSTALL_INDEX_URL $install_args"
   fi
@@ -569,7 +570,7 @@ install_gpustack() {
   fi
 
   # shellcheck disable=SC2090,SC2086
-  pipx install --force --verbose $install_args "$INSTALL_PACKAGE_SPEC"
+  pipx install --force --verbose $install_args --python "$(which python3)" "$INSTALL_PACKAGE_SPEC"
   # Workaround for issue #581
   pipx inject gpustack pydantic==2.9.2 --force > /dev/null 2>&1
 

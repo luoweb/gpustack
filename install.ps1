@@ -19,7 +19,6 @@
 $ErrorActionPreference = "Stop"
 
 $INSTALL_PACKAGE_SPEC = if ($env:INSTALL_PACKAGE_SPEC) { $env:INSTALL_PACKAGE_SPEC } else { "gpustack[audio]" }
-$INSTALL_PRE_RELEASE = if ($env:INSTALL_PRE_RELEASE) { $env:INSTALL_PRE_RELEASE } else { 0 }
 $INSTALL_INDEX_URL = if ($env:INSTALL_INDEX_URL) { $env:INSTALL_INDEX_URL } else { "" }
 $INSTALL_SKIP_POST_CHECK = if ($env:INSTALL_SKIP_POST_CHECK) { $env:INSTALL_SKIP_POST_CHECK } else { 0 }
 
@@ -237,8 +236,10 @@ function Install-Python {
 
     $needInstallPython = $true
     $PYTHON_VERSION = $null
+    $CURRENT_VERSION = $null
     if (Get-Command python -ErrorAction SilentlyContinue) {
         $PYTHON_VERSION = python -c 'import sys; print(sys.version_info.major * 10 + sys.version_info.minor)'
+        $CURRENT_VERSION = python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
         $pythonSource = $(Get-Command python).Source
         $isDirty = (($null -eq $PYTHON_VERSION) -or ($PYTHON_VERSION -eq "")) -and ($pythonSource -match "WindowsApps")
 
@@ -247,8 +248,8 @@ function Install-Python {
             Remove-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\python.exe" -ErrorAction SilentlyContinue
             Remove-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\python3.exe" -ErrorAction SilentlyContinue
         }
-        elseif ($PYTHON_VERSION -lt 40) {
-            throw "Python version is $PYTHON_VERSION, which is less than 3.10. Please upgrade Python to at least version 3.10."
+        elseif ($PYTHON_VERSION -lt 40 -or $PYTHON_VERSION -ge 43) {
+            throw "Python version $CURRENT_VERSION is not supported. Please use Python 3.10, 3.11, or 3.12."
         }
         else {
             $needInstallPython = $false
@@ -277,11 +278,6 @@ function Install-Python {
                 throw "failed to install pipx."
             }
 
-            pipx ensurepath
-            if ($LASTEXITCODE -ne 0) {
-                throw "failed to run pipx ensurepath."
-            }
-
             Log-Info "Pipx installed successfully."
         }
         catch {
@@ -290,6 +286,11 @@ function Install-Python {
     }
     else {
         Log-Info "Pipx already installed."
+    }
+
+    pipx ensurepath --force
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to run pipx ensurepath."
     }
 }
 
@@ -327,10 +328,6 @@ function Install-GPUStack {
     try {
         Log-Info "$ACTION GPUStack..."
         $installArgs = @()
-        if ($INSTALL_PRE_RELEASE -eq 1) {
-            $installArgs += "--pip-args=--pre"
-        }
-
         if ($INSTALL_INDEX_URL) {
             $installArgs += "--index-url=$INSTALL_INDEX_URL"
         }
