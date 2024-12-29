@@ -179,19 +179,19 @@ class Scheduler:
         )
 
         should_update = False
-        if (
-            task_output.resource_claim_estimate.embeddingOnly
-            and not model.embedding_only
-        ):
+        if task_output.resource_claim_estimate.embeddingOnly and not model.categories:
             should_update = True
+            model.categories = ["embedding"]
             model.embedding_only = True
 
-        if task_output.resource_claim_estimate.imageOnly and not model.image_only:
+        if task_output.resource_claim_estimate.imageOnly and not model.categories:
             should_update = True
+            model.categories = ["image"]
             model.image_only = True
 
-        if task_output.resource_claim_estimate.reranking and not model.reranker:
+        if task_output.resource_claim_estimate.reranking and not model.categories:
             should_update = True
+            model.categories = ["reranker"]
             model.reranker = True
 
         if (
@@ -222,7 +222,16 @@ class Scheduler:
         architectures = getattr(pretrained_config, "architectures", []) or []
 
         # https://docs.vllm.ai/en/latest/models/supported_models.html#text-embedding
-        supported_embedding_architectures = ["Gemma2Model", "MistralModel"]
+        supported_embedding_architectures = [
+            "BertModel",
+            "Gemma2Model",
+            "MistralModel",
+            "LlamaModel",
+            "Qwen2Model",
+            "RobertaModel",
+            "RobertaForMaskedLM",
+            "XLMRobertaModel",
+        ]
         is_embedding_model = False
 
         for architecture in architectures:
@@ -272,11 +281,15 @@ class Scheduler:
 
         task_type = model_dict.get("task_type")
         if task_type == "tts":
+            model.categories = ["text_to_speech"]
             model.text_to_speech = True
         elif task_type == "stt":
+            model.categories = ["speech_to_text"]
             model.speech_to_text = True
 
-        if model.text_to_speech or model.speech_to_text:
+        if model.categories and (
+            "text_to_speech" in model.categories or "speech_to_text" in model.categories
+        ):
             await model.update(session)
 
     def _should_schedule(self, instance: ModelInstance) -> bool:

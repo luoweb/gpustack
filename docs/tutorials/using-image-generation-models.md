@@ -47,6 +47,7 @@ The generated image will be displayed in the UI. Your image may look different g
 
 ![Generated](../assets/tutorials/using-image-generation-models/image-playground.png)
 
+
 ## Conclusion
 
-Congratulations! You’ve successfully deployed and used an image generation model in GPUStack. With this setup, you can generate unique and visually compelling images from textual prompts. Experiment with different prompts and settings to push the boundaries of what’s possible.
+Congratulations! You’ve successfully deployed and used an image generation model in GPUStack. With this setup, you can generate unique and visually compelling images from textual prompts. Experiment with different prompts and settings to push the boundaries of what’s possible. For more details, refer to [Recommended Parameters for Image Generation Models](./recommended-parameters-for-image-generation-models.md)

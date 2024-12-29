@@ -10,6 +10,7 @@ from gpustack.schemas.workers import (
     VendorEnum,
     GPUDevicesInfo,
 )
+from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
 
 _config = None
 
@@ -167,6 +168,7 @@ class Config(BaseSettings):
             index = gd.get("index")
             vendor = gd.get("vendor")
             memory = gd.get("memory")
+            type = gd.get("type") or device_type_from_vendor(vendor)
 
             if not name:
                 raise Exception("GPU device name is required")
@@ -176,11 +178,16 @@ class Config(BaseSettings):
 
             if vendor not in VendorEnum.__members__.values():
                 raise Exception(
-                    "Unsupported GPU device vendor, supported vendors are: Apple, NVIDIA, 'Moore Threads', Huawei"
+                    "Unsupported GPU device vendor, supported vendors are: Apple, NVIDIA, 'Moore Threads', Huawei, AMD"
                 )
 
             if not memory:
                 raise Exception("GPU device memory is required")
+
+            if type not in DeviceTypeEnum.__members__.values():
+                raise Exception(
+                    "Unsupported GPU type, supported type are: cuda, musa, npu, mps, rocm"
+                )
 
             memory_total = memory.get("total")
             memory_is_unified_memory = memory.get("is_unified_memory", False)
@@ -195,6 +202,7 @@ class Config(BaseSettings):
                     memory=MemoryInfo(
                         total=memory_total, is_unified_memory=memory_is_unified_memory
                     ),
+                    type=type,
                 )
             )
 

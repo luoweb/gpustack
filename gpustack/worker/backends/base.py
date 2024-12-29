@@ -4,18 +4,20 @@ import os
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 from abc import ABC, abstractmethod
 
 from gpustack.client.generated_clientset import ClientSet
 from gpustack.config.config import Config
 from gpustack.logging import setup_logging
 from gpustack.schemas.models import (
+    Model,
     ModelInstance,
     ModelInstanceUpdate,
     SourceEnum,
     ModelInstanceStateEnum,
     get_backend,
+    get_extra_filename,
 )
 from gpustack.schemas.workers import VendorEnum, GPUDevicesInfo
 from gpustack.utils import platform
@@ -32,6 +34,7 @@ lock = threading.Lock()
 ACCELERATOR_VENDOR_TO_ENV_NAME = {
     VendorEnum.NVIDIA: "CUDA_VISIBLE_DEVICES",
     VendorEnum.Huawei: "ASCEND_RT_VISIBLE_DEVICES",
+    VendorEnum.AMD: "ROCR_VISIBLE_DEVICES",
 }
 
 
@@ -67,45 +70,47 @@ def time_decorator(func):
 
 
 def download_model(
-    mi: ModelInstance,
+    model: Model,
     cache_dir: Optional[str] = None,
     ollama_library_base_url: Optional[str] = None,
     huggingface_token: Optional[str] = None,
 ) -> str:
-    if mi.source == SourceEnum.HUGGING_FACE:
+    if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.download(
-            repo_id=mi.huggingface_repo_id,
-            filename=mi.huggingface_filename,
+            repo_id=model.huggingface_repo_id,
+            filename=model.huggingface_filename,
+            extra_filename=get_extra_filename(model),
             token=huggingface_token,
             cache_dir=os.path.join(cache_dir, "huggingface"),
         )
-    elif mi.source == SourceEnum.OLLAMA_LIBRARY:
+    elif model.source == SourceEnum.OLLAMA_LIBRARY:
         ollama_downloader = OllamaLibraryDownloader(
             registry_url=ollama_library_base_url
         )
         return ollama_downloader.download(
-            model_name=mi.ollama_library_model_name,
+            model_name=model.ollama_library_model_name,
             cache_dir=os.path.join(cache_dir, "ollama"),
         )
-    elif mi.source == SourceEnum.MODEL_SCOPE:
+    elif model.source == SourceEnum.MODEL_SCOPE:
         return ModelScopeDownloader.download(
-            model_id=mi.model_scope_model_id,
-            file_path=mi.model_scope_file_path,
+            model_id=model.model_scope_model_id,
+            file_path=model.model_scope_file_path,
+            extra_file_path=get_extra_filename(model),
             cache_dir=os.path.join(cache_dir, "model_scope"),
         )
-    elif mi.source == SourceEnum.LOCAL_PATH:
-        return mi.local_path
+    elif model.source == SourceEnum.LOCAL_PATH:
+        return model.local_path
 
 
-def get_model_file_size(mi: ModelInstance, cfg: Config) -> Optional[int]:
-    if mi.source == SourceEnum.HUGGING_FACE:
+def get_model_file_size(model: Model, cfg: Config) -> Optional[int]:
+    if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.get_model_file_size(
-            model_instance=mi,
+            model=model,
             token=cfg.huggingface_token,
         )
-    elif mi.source == SourceEnum.MODEL_SCOPE:
+    elif model.source == SourceEnum.MODEL_SCOPE:
         return ModelScopeDownloader.get_model_file_size(
-            model_instance=mi,
+            model=model,
         )
 
     return None
@@ -141,22 +146,23 @@ class InferenceServer(ABC):
     ):
         setup_logging(debug=cfg.debug)
 
-        model_file_size = get_model_file_size(mi, cfg)
-        if model_file_size:
-            logger.debug(f"Model file size: {model_file_size}")
-            self._model_file_size = model_file_size
-            self._model_downloaded_size = 0
-        # for download progress update frequency control
-        self._last_download_update_time = time.time()
-        self.hijack_tqdm_progress()
-
-        self._clientset = clientset
-        self._model_instance = mi
-        self._config = cfg
         try:
+            self._clientset = clientset
+            self._model_instance = mi
+            self._config = cfg
             self._model = self._clientset.models.get(id=mi.model_id)
-            self._until_model_instance_initializing()
 
+            model_file_size = get_model_file_size(self._model, cfg)
+            if model_file_size:
+                logger.debug(f"Model file size: {model_file_size}")
+                self._model_file_size = model_file_size
+                self._model_downloaded_size = 0
+
+            # for download progress update frequency control
+            self._last_download_update_time = time.time()
+            self.hijack_tqdm_progress()
+
+            self._until_model_instance_initializing()
             if self._model.backend_version:
                 tools_manager = ToolsManager(
                     tools_download_base_url=cfg.tools_download_base_url,
@@ -175,14 +181,14 @@ class InferenceServer(ABC):
             self._update_model_instance(mi.id, **patch_dict)
 
             self._model_path = download_model(
-                mi,
+                self._model,
                 cfg.cache_dir,
                 ollama_library_base_url=cfg.ollama_library_base_url,
                 huggingface_token=cfg.huggingface_token,
             )
 
             patch_dict = {
-                "state": ModelInstanceStateEnum.RUNNING,
+                "state": ModelInstanceStateEnum.STARTING,
                 "state_message": "",
             }
             self._update_model_instance(mi.id, **patch_dict)
@@ -298,7 +304,7 @@ class InferenceServer(ABC):
 
     @staticmethod
     def get_inference_running_env(
-        gpu_indexes: List[int] = None, gpu_devices: GPUDevicesInfo = None
+        gpu_indexes: List[int] = None, gpu_devices: GPUDevicesInfo = None, backend=None
     ):
         env = os.environ.copy()
         system = platform.system()
@@ -317,10 +323,51 @@ class InferenceServer(ABC):
 
             env_name = get_env_name_by_vendor(vendor)
             env[env_name] = ",".join([str(i) for i in gpu_indexes])
+            set_vllm_env(env, vendor, backend, gpu_indexes, gpu_devices)
+
             return env
         else:
             # TODO: support more.
             return None
+
+
+def set_vllm_env(
+    env: Dict[str, str],
+    vendor: VendorEnum,
+    backend: str,
+    gpu_indexes: List[int] = None,
+    gpu_devices: GPUDevicesInfo = None,
+):
+
+    system = platform.system()
+    if not gpu_indexes or not gpu_devices:
+        return
+
+    if system != "linux" or vendor != VendorEnum.AMD or backend != "vllm":
+        return
+
+    llvm = None
+    for g in gpu_devices:
+        if (
+            g.index in gpu_indexes
+            and g.labels.get("llvm")
+            and g.vendor == VendorEnum.AMD
+        ):
+            llvm = g.labels.get("llvm")
+            break
+
+    if llvm:
+        # vllm supports llvm target: gfx908;gfx90a;gfx942;gfx1100,
+        # try to use the similar LLVM target that is supported.
+        # https://docs.vllm.ai/en/v0.6.2/getting_started/amd-installation.html#build-from-source-rocm
+        # https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html
+        emulate_gfx_version = {
+            "gfx1101": "11.0.0",
+            "gfx1102": "11.0.0",
+        }
+
+        if emulate_gfx_version.get(llvm):
+            env["HSA_OVERRIDE_GFX_VERSION"] = emulate_gfx_version[llvm]
 
 
 def get_env_name_by_vendor(vendor: str) -> str:

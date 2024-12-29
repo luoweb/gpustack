@@ -132,7 +132,7 @@ class Worker:
         gpu_devices = self._config.get_gpu_devices()
         if gpu_devices:
             vendor = gpu_devices[0].vendor
-            return platform.device_from_vendor(vendor)
+            return platform.device_type_from_vendor(vendor)
         return None
 
     async def start_async(self):
@@ -159,8 +159,10 @@ class Worker:
             # Start rpc server instances with restart.
             run_periodically_in_thread(self._worker_manager.start_rpc_servers, 20, 3)
 
-        # Monitor the processes of model instances every 60 seconds.
-        run_periodically_in_thread(self._serve_manager.monitor_processes, 60)
+        # Check serving model instances' health every 3 seconds.
+        run_periodically_in_thread(
+            self._serve_manager.health_check_serving_instances, 3
+        )
         # Watch model instances with retry.
         run_periodically_in_thread(self._serve_manager.watch_model_instances, 5)
 

@@ -18,6 +18,7 @@ from gpustack.schemas.models import (
     Model,
     ModelInstance,
     ModelInstanceRPCServer,
+    is_image_model,
 )
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import get_engine
@@ -66,8 +67,8 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         candidate_functions = [
             self.find_single_worker_single_gpu_full_offloading_candidates,
             self.find_single_worker_multi_gpu_full_offloading_candidates,
-            self.find_single_worker_partial_offloading_candidates,
             self.find_multi_worker_multi_gpu_candidates,
+            self.find_single_worker_partial_offloading_candidates,
             self.find_single_worker_cpu_candidates,
         ]
 
@@ -83,7 +84,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             ) and candidate_func == self.find_multi_worker_multi_gpu_candidates:
                 continue
 
-            if self._model.image_only and not (
+            if is_image_model(self._model) and not (
                 candidate_func
                 == self.find_single_worker_single_gpu_full_offloading_candidates
             ):
@@ -739,7 +740,9 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
 
             result = await get_worker_allocatable_resource(self._engine, worker)
             workers_allocatable[worker.id] = result
-            workers_allocatable_vram.append([worker.id, sum(result.vram.values())])
+            worker_allocatable_vram = sum(result.vram.values())
+            if worker_allocatable_vram > 0:
+                workers_allocatable_vram.append([worker.id, worker_allocatable_vram])
 
             for gpu_device in worker.status.gpu_devices:
                 if gpu_device.index is None:
@@ -747,9 +750,11 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                         f"gpu index is not found for {worker.name} {gpu_device.name}"
                     )
 
-                workers_gpus_allocatable.append(
-                    [worker.id, gpu_device.index, result.vram.get(gpu_device.index)]
-                )
+                gpu_allocatable_vram = result.vram.get(gpu_device.index)
+                if gpu_allocatable_vram is not None and gpu_allocatable_vram > 0:
+                    workers_gpus_allocatable.append(
+                        [worker.id, gpu_device.index, gpu_allocatable_vram]
+                    )
 
         sorted_workers = sorted(
             workers_allocatable_vram, key=lambda item: item[1], reverse=True
