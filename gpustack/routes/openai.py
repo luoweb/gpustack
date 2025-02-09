@@ -19,7 +19,13 @@ from gpustack.api.exceptions import (
 )
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack.http_proxy.load_balancer import LoadBalancer
-from gpustack.schemas.models import Model, ModelInstance, ModelInstanceStateEnum
+from gpustack.routes.models import build_pg_category_condition
+from gpustack.schemas.models import (
+    CategoryEnum,
+    Model,
+    ModelInstance,
+    ModelInstanceStateEnum,
+)
 from gpustack.server.deps import SessionDep
 
 
@@ -110,33 +116,39 @@ async def list_models(
     statement = select(Model).where(Model.ready_replicas > 0)
 
     if embedding_only is not None:
-        categories.append("embedding")
+        categories.append(CategoryEnum.EMBEDDING)
 
     if image_only is not None:
-        categories.append("image")
+        categories.append(CategoryEnum.IMAGE)
 
     if reranker is not None:
-        categories.append("reranker")
+        categories.append(CategoryEnum.RERANKER)
 
     if speech_to_text is not None:
-        categories.append("speech_to_speech")
+        categories.append(CategoryEnum.SPEECH_TO_TEXT)
 
     if text_to_speech is not None:
-        categories.append("text_to_speech")
+        categories.append(CategoryEnum.TEXT_TO_SPEECH)
 
     if categories:
-        statement = statement.where(
-            or_(
-                *[
-                    (
-                        col(Model.categories) == []
-                        if category == ""
-                        else col(Model.categories).contains(category)
-                    )
-                    for category in categories
-                ]
+        if session.bind.dialect.name == "sqlite":
+            statement = statement.where(
+                or_(
+                    *[
+                        (
+                            col(Model.categories) == []
+                            if category == ""
+                            else col(Model.categories).contains(category)
+                        )
+                        for category in categories
+                    ]
+                )
             )
-        )
+        else:  # For PostgreSQL
+            category_conditions = [
+                build_pg_category_condition(category) for category in categories
+            ]
+            statement = statement.where(or_(*category_conditions))
 
     models = (await session.exec(statement)).all()
     result = SyncPage[OAIModel](data=[], object="list")
@@ -177,7 +189,9 @@ async def proxy_request_by_model(request: Request, session: SessionDep, endpoint
 
     try:
         if stream:
-            return await handle_streaming_request(request, url, body_json)
+            return await handle_streaming_request(
+                request, url, body_json, form_data, form_files
+            )
         else:
             return await handle_standard_request(
                 request, url, body_json, form_data, form_files
@@ -220,6 +234,10 @@ async def parse_request_body(request: Request, session: SessionDep):
             message="Missing 'model' field",
             is_openai_exception=True,
         )
+
+    if form_data and form_data.get("stream", False):
+        # stream may be set in form data, e.g., image edits.
+        stream = True
 
     model = await get_model(session, model_name)
     return model, stream, body_json, form_data, form_files
@@ -266,7 +284,11 @@ async def get_model(session: SessionDep, model_name: Optional[str]):
 
 
 async def handle_streaming_request(
-    request: Request, url: str, body_json: Optional[dict]
+    request: Request,
+    url: str,
+    body_json: Optional[dict],
+    form_data: Optional[dict],
+    form_files: Optional[list],
 ):
     timeout = 300
     headers = filter_headers(request.headers)
@@ -283,7 +305,9 @@ async def handle_streaming_request(
                     method=request.method,
                     url=url,
                     headers=headers,
-                    json=body_json,
+                    json=body_json if body_json else None,
+                    data=form_data if form_data else None,
+                    files=form_files if form_files else None,
                     timeout=timeout,
                 ) as resp:
                     if resp.status_code >= 400:
@@ -354,6 +378,7 @@ def filter_headers(headers):
         if key.lower() != "content-length"
         and key.lower() != "host"
         and key.lower() != "content-type"
+        and key.lower() != "transfer-encoding"
     }
 
 

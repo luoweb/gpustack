@@ -10,6 +10,7 @@ from gpustack.utils import platform
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceStateEnum,
+    is_embedding_model,
     is_image_model,
     is_renaker_model,
 )
@@ -39,19 +40,15 @@ class LlamaBoxServer(InferenceServer):
         if claim is not None and claim.get("offload_layers") is not None:
             layers = claim.get("offload_layers")
 
-        main_worker_tensor_split = []
-        if (
-            self._model_instance.gpu_indexes
-            and len(self._model_instance.gpu_indexes) > 0
-        ):
-            vram_claims = claim.get("vram").values()
-            main_worker_tensor_split = vram_claims
-
         workers = self._clientset.workers.list()
         worker_map = {worker.id: worker for worker in workers.items}
         rpc_servers, rpc_server_tensor_split = get_rpc_servers(
             self._model_instance, worker_map
         )
+
+        default_parallel = "4"
+        if is_renaker_model(self._model) or is_embedding_model(self._model):
+            default_parallel = "1"
 
         arguments = [
             "--host",
@@ -60,13 +57,15 @@ class LlamaBoxServer(InferenceServer):
             "--gpu-layers",
             str(layers),
             "--parallel",
-            "4",
+            default_parallel,
             "--ctx-size",
             "8192",
             "--port",
             str(self._model_instance.port),
             "--model",
             self._model_path,
+            "--alias",
+            self._model.name,
             "--no-mmap",
             "--no-warmup",
         ]
@@ -75,7 +74,8 @@ class LlamaBoxServer(InferenceServer):
             arguments.append("--rerank")
 
         if is_image_model(self._model):
-            arguments.extend(["--images", "--image-vae-tiling"])
+            # TODO support multi-GPU for image models
+            arguments.extend(["--images", "--image-vae-tiling", "--tensor-split", "1"])
 
         mmproj = find_parameter(self._model.backend_parameters, ["mmproj"])
         default_mmproj = get_mmproj_file(self._model_path)
@@ -86,19 +86,34 @@ class LlamaBoxServer(InferenceServer):
             rpc_servers_argument = ",".join(rpc_servers)
             arguments.extend(["--rpc", rpc_servers_argument])
 
-        final_tensor_split = []
+        # legacy support for tensor split field is empty
+        main_worker_tensor_split = []
+        if (
+            self._model_instance.gpu_indexes
+            and len(self._model_instance.gpu_indexes) > 0
+        ):
+            vram_claims = claim.get("vram").values()
+            main_worker_tensor_split = vram_claims
+
+        legacy_tensor_split = []
         if rpc_server_tensor_split:
-            final_tensor_split.extend(rpc_server_tensor_split)
-            final_tensor_split.extend(main_worker_tensor_split)
+            legacy_tensor_split.extend(rpc_server_tensor_split)
+            legacy_tensor_split.extend(main_worker_tensor_split)
         elif len(main_worker_tensor_split) > 1:
-            final_tensor_split.extend(main_worker_tensor_split)
+            legacy_tensor_split.extend(main_worker_tensor_split)
+
+        tensor_split = legacy_tensor_split
+        if self._model_instance.computed_resource_claim.get("tensor_split"):
+            tensor_split = self._model_instance.computed_resource_claim.get(
+                "tensor_split"
+            )
 
         user_tensor_split = find_parameter(
             self._model.backend_parameters, ["ts", "tensor-split"]
         )
-        if user_tensor_split is None and final_tensor_split:
+        if user_tensor_split is None and tensor_split:
             tensor_split_argument = ",".join(
-                [str(int(tensor / (1024 * 1024))) for tensor in final_tensor_split]
+                [str(int(tensor / (1024 * 1024))) for tensor in tensor_split]
             )  # convert to MiB to prevent overflow
 
             arguments.extend(["--tensor-split", tensor_split_argument])
@@ -135,7 +150,8 @@ class LlamaBoxServer(InferenceServer):
             )
 
             set_priority(proc.pid)
-            proc.wait()
+            exit_code = proc.wait()
+            self.exit_with_code(exit_code)
 
         except Exception as e:
             error_message = f"Failed to run the llama-box server: {e}"
@@ -148,6 +164,7 @@ class LlamaBoxServer(InferenceServer):
                 self._update_model_instance(self._model_instance.id, **patch_dict)
             except Exception as ue:
                 logger.error(f"Failed to update model instance: {ue}")
+            sys.exit(1)
 
     def normalize_mmproj_path(self):
         """

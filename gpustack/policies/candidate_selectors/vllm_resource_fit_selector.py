@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from gpustack.policies.base import (
     ModelInstanceScheduleCandidate,
@@ -21,6 +21,8 @@ from gpustack.schemas.workers import GPUDevicesInfo, Worker
 
 from gpustack.server.db import get_engine
 from gpustack.utils.command import find_parameter
+from gpustack.utils.convert import safe_int
+from gpustack.utils.gpu import parse_gpu_id, parse_gpu_ids_by_worker
 from gpustack.utils.hub import get_pretrained_config
 
 logger = logging.getLogger(__name__)
@@ -70,11 +72,30 @@ async def estimate_model_vram(model: Model) -> int:
     return weight_size * 1.2 + cuda_graph_size
 
 
+def get_model_num_attention_heads(model: Model) -> Optional[int]:
+    """
+    Get the number of attention heads in the model.
+    """
+
+    num_attention_heads = None
+    try:
+        config = get_pretrained_config(model, trust_remote_code=True)
+        num_attention_heads = getattr(config, "num_attention_heads", None)
+        if not num_attention_heads:
+            llm_config = getattr(config, "llm_config", None)
+            if llm_config:
+                num_attention_heads = getattr(llm_config, "num_attention_heads", None)
+    except Exception as e:
+        logger.warning(f"Cannot get num_attention_heads for model {model.name}: {e}")
+
+    return num_attention_heads
+
+
 def get_hub_model_weight_size(model: Model) -> int:
     # Infer from the model name.
     model_id = model.huggingface_repo_id or model.model_scope_model_id
     total_params = parse_model_size_by_name(model_id)
-    config = get_pretrained_config(model)
+    config = get_pretrained_config(model, trust_remote_code=True)
 
     return get_model_weight_size_by_pretrained_config(config, total_params)
 
@@ -98,7 +119,7 @@ def get_model_weight_size_by_pretrained_config(config: Any, total_params: int) -
 
             return int(total_weight_size)
 
-        elif quant_method in ["gptq"]:
+        elif quant_method in ["gptq", "awq"]:
             bits = quantization_config.get("bits", 4)  # Typically 4-bit
             total_weight_size = total_params * bits / 8
 
@@ -172,10 +193,28 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         self._model_instance = model_instance
         self._gpu_count = None
         self._vram_claim = 0
+        self._num_attention_heads = None
+
+        self._selected_gpu_worker = None
+        self._selected_gpu_indexes = []
+
+        if self._model.gpu_selector and self._model.gpu_selector.gpu_ids:
+            gpu_ids_by_worker = parse_gpu_ids_by_worker(
+                self._model.gpu_selector.gpu_ids
+            )
+            self._selected_gpu_worker = next(iter(gpu_ids_by_worker.keys()))
+            for gpu_id in gpu_ids_by_worker.get(self._selected_gpu_worker, []):
+                valid, matched = parse_gpu_id(gpu_id)
+                if valid:
+                    gpu_index = safe_int(matched.get("gpu_index"))
+                    self._selected_gpu_indexes.append(gpu_index)
 
         # When user defined gpu selector, we use the gpu count from it.
         if self._model.gpu_selector and self._model.gpu_selector.gpu_ids:
             self._gpu_count = len(self._model.gpu_selector.gpu_ids)
+            self._selected_gpu_ids_by_worker = parse_gpu_ids_by_worker(
+                self._model.gpu_selector.gpu_ids
+            )
 
         # When tp/pp is set, the gpu count is calculated by tp * pp.
         # Pick the candidate with satisfied gpu count.
@@ -188,10 +227,30 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             if pp:
                 self._gpu_count *= int(pp)
 
+            if self._selected_gpu_worker:
+                # ignore the gpu_selector if tp/pp is set
+                logger.info(
+                    f"Model {model.name} has tp/pp set, ignore the gpu_selector"
+                )
+                self._selected_gpu_worker = None
+                self._selected_gpu_indexes = None
+
         self._gpu_memory_utilization = 0.9
         gmu = find_parameter(model.backend_parameters, ["gpu-memory-utilization"])
         if gmu:
             self._gpu_memory_utilization = float(gmu)
+
+        self._num_attention_heads = get_model_num_attention_heads(model)
+        if (
+            self._gpu_count
+            and self._num_attention_heads
+            and self._num_attention_heads % self._gpu_count != 0
+        ):
+            raise ValueError(
+                f"Total number of attention heads ({self._num_attention_heads})"
+                " must be divisible by gpu count "
+                f"({self._gpu_count})."
+            )
 
     async def select_candidates(
         self, workers: List[Worker]
@@ -254,12 +313,27 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         Find single worker single gpu full offloading candidates for the model instance with worker.
         requires: worker.status.gpu_devices is not None
         """
+
+        if self._selected_gpu_worker:
+            if (
+                worker.name != self._selected_gpu_worker
+                or len(self._selected_gpu_indexes) > 1
+            ):
+                return []
+
         candidates = []
 
         allocatable = await get_worker_allocatable_resource(self._engine, worker)
 
         if worker.status.gpu_devices:
             for _, gpu in enumerate(worker.status.gpu_devices):
+
+                if (
+                    self._selected_gpu_indexes
+                    and gpu.index != self._selected_gpu_indexes[0]
+                ):
+                    continue
+
                 gpu_index = gpu.index
                 allocatable_vram = allocatable.vram.get(gpu_index, 0)
 
@@ -345,6 +419,30 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             reverse=True,
         )
 
+        if self._selected_gpu_worker:
+            if worker.name != self._selected_gpu_worker:
+                return []
+
+            vram_claim = {
+                gpu_index: int(
+                    allocatable.vram.get(gpu_index, 0) * self._gpu_memory_utilization
+                )
+                for gpu_index in self._selected_gpu_indexes
+            }
+
+            if sum(vram_claim.values()) < self._vram_claim:
+                return []
+
+            return [
+                ModelInstanceScheduleCandidate(
+                    worker=worker,
+                    gpu_indexes=self._selected_gpu_indexes,
+                    computed_resource_claim=ComputedResourceClaim(
+                        vram=vram_claim,
+                    ),
+                )
+            ]
+
         vram_sum = 0
         gpu_sum = 0
         gpu_indexes = []
@@ -355,6 +453,9 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             vram_claim[gpu.index] = int(gpu.memory.total * self._gpu_memory_utilization)
             gpu_sum += 1
             vram_sum += vram_claim[gpu.index]
+
+            if self._num_attention_heads and self._num_attention_heads % gpu_sum != 0:
+                continue
 
             if self._gpu_count and gpu_sum >= self._gpu_count:
                 found_candidate = True

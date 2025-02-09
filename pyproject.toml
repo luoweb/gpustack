@@ -21,7 +21,7 @@ prometheus-client = "^0.20.0"
 colorama = "^0.4.6"
 psutil = "^5.9.8"
 requests = "^2.32.3"
-huggingface-hub = "^0.23.3"
+huggingface-hub = "^0.27.0"
 attrs = "^24.2.0"
 aiosqlite = "^0.20.0"
 sqlalchemy = {extras = ["asyncio"], version = "^2.0.30"}
@@ -39,7 +39,7 @@ truststore = "^0.9.1"
 cryptography = "^43.0.0"
 tzdata = "^2024.1"
 modelscope = "^1.19.0"
-vllm = {version = "0.6.6", optional = true}
+vllm = {version = "0.7.2", optional = true}
 mistral_common = {version = "^1.4.3", optional = true, extras = ["opencv"]}
 uvicorn = "^0.32.0"
 transformers = "^4.44.2"
@@ -48,9 +48,11 @@ wmi = { version="^1.5.1", markers = "platform_system == 'Windows'" }
 pywin32 = { version="^308", markers = "platform_system == 'Windows'" }
 packaging = "^24.1"
 psycopg2-binary = "^2.9.10"
-vox-box = {version = "0.0.9", optional = true}
+vox-box = {version = "0.0.11", optional = true}
 
 tenacity = "^9.0.0"
+aiofiles = "^23.2.1"
+aiohttp = "^3.11.2"
 [tool.poetry.group.dev.dependencies]
 coverage = {extras = ["toml"], version = "^7.5.1"}
 flake8 = "^7.0.0"

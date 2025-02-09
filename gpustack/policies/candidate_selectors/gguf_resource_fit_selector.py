@@ -23,10 +23,12 @@ from gpustack.schemas.models import (
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import get_engine
 from gpustack.utils.command import find_parameter
+from gpustack.utils.gpu import parse_gpu_id, parse_gpu_ids_by_worker
+
 
 logger = logging.getLogger(__name__)
 
-MAX_RPC_SERVER_COUNT = 3
+DEFAULT_MAX_RPC_SERVER_COUNT = 10
 
 
 class GGUFResourceFitSelector(ScheduleCandidatesSelector):
@@ -40,13 +42,56 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         self._model = model
         self._model_instance = model_instance
         self._cache_dir = cache_dir
+        self._max_rpc_server_count = DEFAULT_MAX_RPC_SERVER_COUNT
+        self._workers_allocatable_resource = {}
 
         self._param_tensor_split = find_parameter(
             model.backend_parameters, ["ts", "tensor-split"]
         )
 
+        self._selected_gpu_ids_by_worker = {}
+        self._selected_gpu_ids = []
+        if self._model.gpu_selector and self._model.gpu_selector.gpu_ids:
+            self._selected_gpu_ids_by_worker = parse_gpu_ids_by_worker(
+                self._model.gpu_selector.gpu_ids
+            )
+            self._selected_gpu_ids = sorted(self._model.gpu_selector.gpu_ids)
+            self._max_rpc_server_count = len(self._selected_gpu_ids)
+
+        if self._param_tensor_split:
+            # ignore the gpu_selector if tensor split is set.
+            logger.info(f"Model {model.name} has tensor-split, ignore the gpu_selector")
+            self._selected_gpu_ids_by_worker = {}
+            self._selected_gpu_ids = []
+
     def _has_distributed_params(self):
         return self._param_tensor_split
+
+    def _get_gpu_layers(self) -> Optional[str]:
+        return find_parameter(
+            self._model.backend_parameters, ["ngl", "gpu-layers", "n-gpu-layers"]
+        )
+
+    async def _get_worker_allocatable_resource(self, worker: Worker) -> Allocatable:
+        if self._workers_allocatable_resource.get(worker.id):
+            return self._workers_allocatable_resource.get(worker.id)
+
+        return await get_worker_allocatable_resource(self._engine, worker)
+
+    def _set_max_rpc_server_count(self, workers: List[Worker]):
+        if not self._selected_gpu_ids:
+            total_gpu = sum(
+                len(worker.status.gpu_devices)
+                for worker in workers
+                if worker.status.gpu_devices
+            )
+            self._max_rpc_server_count = total_gpu
+
+    async def _set_workers_allocatable_resource(self, workers: List[Worker]):
+        for worker in workers:
+            self._workers_allocatable_resource[worker.id] = (
+                await get_worker_allocatable_resource(self._engine, worker)
+            )
 
     async def select_candidates(
         self, workers: List[Worker]
@@ -54,6 +99,11 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         """
         Get schedule candidates by the resource fit claim.
         """
+
+        # reset the data with input workers.
+        self._set_max_rpc_server_count(workers)
+        await self._set_workers_allocatable_resource(workers)
+
         candidates = await self._filter_in_sequence(workers)
         return candidates
 
@@ -73,26 +123,12 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         ]
 
         for candidate_func in candidate_functions:
-            if (not self._model.cpu_offloading) and (
-                candidate_func == self.find_single_worker_partial_offloading_candidates
-                or candidate_func == self.find_single_worker_cpu_candidates
-            ):
-                continue
-
-            if (
-                not self._model.distributed_inference_across_workers
-            ) and candidate_func == self.find_multi_worker_multi_gpu_candidates:
-                continue
-
-            if is_image_model(self._model) and not (
-                candidate_func
-                == self.find_single_worker_single_gpu_full_offloading_candidates
-            ):
-                # Only full offloading is supported for image models.
+            if self._should_skip_candidate_func(candidate_func):
                 continue
 
             logger.debug(
-                f"model {self._model.name}, filter candidates with resource fit selector: {candidate_func.__name__}, instance {self._model_instance.name}"
+                f"model {self._model.name}, filter candidates with resource fit selector: "
+                f"{candidate_func.__name__}, instance {self._model_instance.name}",
             )
 
             candidates = await candidate_func(workers)
@@ -100,6 +136,74 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                 return candidates
 
         return []
+
+    def _should_skip_candidate_func(self, candidate_func) -> bool:
+        # Skip conditions for CPU offloading.
+        if not self._model.cpu_offloading and candidate_func in [
+            self.find_single_worker_partial_offloading_candidates,
+            self.find_single_worker_cpu_candidates,
+        ]:
+            return True
+
+        if (
+            self._get_gpu_layers() == "0"
+            and candidate_func != self.find_single_worker_cpu_candidates
+        ):
+            # User specified full CPU offloading.
+            return True
+
+        # Skip conditions for manual scheduling.
+        if self._selected_gpu_ids:
+            if candidate_func == self.find_single_worker_cpu_candidates:
+                return True
+
+            worker_num = len(self._selected_gpu_ids_by_worker)
+            if (
+                worker_num > 1
+                and candidate_func != self.find_multi_worker_multi_gpu_candidates
+            ):
+                return True
+
+            if worker_num == 1:
+                selected_worker_name = next(
+                    iter(self._selected_gpu_ids_by_worker.keys())
+                )
+                selected_gpu_count = len(
+                    self._selected_gpu_ids_by_worker.get(selected_worker_name)
+                )
+
+                if (
+                    candidate_func == self.find_multi_worker_multi_gpu_candidates
+                    or (
+                        selected_gpu_count > 1
+                        and candidate_func
+                        == self.find_single_worker_single_gpu_full_offloading_candidates
+                    )
+                    or (
+                        selected_gpu_count == 1
+                        and candidate_func
+                        == self.find_single_worker_multi_gpu_full_offloading_candidates
+                    )
+                ):
+                    return True
+
+        # Skip conditions for distributed inference.
+        if (
+            not self._model.distributed_inference_across_workers
+            and candidate_func == self.find_multi_worker_multi_gpu_candidates
+        ):
+            return True
+
+        # Skip conditions for image models.
+        if (
+            is_image_model(self._model)
+            and candidate_func
+            != self.find_single_worker_single_gpu_full_offloading_candidates
+        ):
+            # Only full offloading is supported for image models.
+            return True
+
+        return False
 
     async def find_single_worker_single_gpu_full_offloading_candidates(
         self, workers: List[Worker]
@@ -135,7 +239,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         candidates = []
 
         is_unified_memory = worker.status.memory.is_unified_memory
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
+        allocatable = await self._get_worker_allocatable_resource(worker)
 
         result = await calculate_model_resource_claim(
             self._model_instance,
@@ -220,7 +324,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         if total_gpu < 2:
             return None
 
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
+        allocatable = await self._get_worker_allocatable_resource(worker)
         gpu_combinations = await self._generate_combinations_for_worker_gpu(
             allocatable, worker
         )
@@ -291,6 +395,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                             vram=vram_claim,
                             ram=ram_claim,
                             total_layers=total_layers,
+                            tensor_split=tensor_splitting,
                         ),
                     )
                 )
@@ -353,7 +458,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             )
         return final_candidates
 
-    async def _find_single_worker_single_gpu_partial_offloading_candidates(
+    async def _find_single_worker_single_gpu_partial_offloading_candidates(  # noqa: C901
         self, worker: Worker
     ) -> List[ModelInstanceScheduleCandidate]:
         """
@@ -363,10 +468,16 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         if self._has_distributed_params():
             return []
 
+        if self._selected_gpu_ids_by_worker:
+            if worker.name not in self._selected_gpu_ids_by_worker:
+                return []
+            elif len(self._selected_gpu_ids_by_worker.get(worker.name)) > 1:
+                return []
+
         candidates = []
 
         is_unified_memory = worker.status.memory.is_unified_memory
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
+        allocatable = await self._get_worker_allocatable_resource(worker)
 
         result = await calculate_model_resource_claim(
             self._model_instance,
@@ -399,6 +510,12 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             )
 
         for gpu_index in allocatable.vram:
+            if self._selected_gpu_ids:
+                valid, matched = parse_gpu_id(self._selected_gpu_ids[0])
+                is_selected_gpu = valid and matched.get("gpu_index") == str(gpu_index)
+                if not is_selected_gpu:
+                    continue
+
             index = binary_search(arr, allocatable.vram[gpu_index])
             if index == -1:
                 continue
@@ -438,9 +555,8 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             gpu_combination (List[Tuple[int]]): A list of tuples, each containing GPU index and it's vram (e.g., [(0, 106), (1, 98)])
         """
 
-        gpu_count = len(gpu_combination)
         is_unified_memory = worker.status.memory.is_unified_memory
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
+        allocatable = await self._get_worker_allocatable_resource(worker)
 
         tensor_splitting = [value[-1] for value in gpu_combination]
         result = await calculate_model_resource_claim(
@@ -454,69 +570,48 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         total_layers = estimate.items[-1].offloadLayers
 
         gpu_indexes_mapping = [value[0] for value in gpu_combination]
-        gpu_offload_layers = {}
-        for estimate_gpu_index in range(gpu_count):
-            vram_claims = [
-                (
-                    memory.vrams[estimate_gpu_index].uma
-                    if is_unified_memory
-                    else memory.vrams[estimate_gpu_index].nonuma
-                )
-                for memory in estimate.items
-                if not memory.fullOffloaded
-            ]
-
-            actual_gpu_index = gpu_indexes_mapping[estimate_gpu_index]
-            index = binary_search(vram_claims, allocatable.vram[actual_gpu_index])
-            if index <= 0:
-                continue
-
-            memory_estimate = estimate.items[index]
-            if (
-                is_unified_memory
-                and memory_estimate.ram.uma
-                > allocatable.ram
-                - sum(vram.uma for vram in estimate.items[index].vrams)
-            ) or (memory_estimate.ram.nonuma > allocatable.ram):
-                continue
-
-            actual_gpu_index = gpu_indexes_mapping[estimate_gpu_index]
-            gpu_offload_layers[actual_gpu_index] = {
-                "offload_layers": estimate.items[index].offloadLayers,
-            }
-
-        if len(gpu_offload_layers) != gpu_count:
-            return None
-
-        # Find the minimum offload layers among all gpus, offload layers less than it will need more ram and less vram.
-        try_offload_layers = min(
-            layers["offload_layers"] for layers in gpu_offload_layers.values()
-        )
 
         final_offload_layers = -1
-        final_gpu_claims = {}
         final_ram_claim = -1
+        final_gpu_claims = {}
         final_gpu_indexes = []
-        for item in estimate.items[try_offload_layers::-1]:
+        for item in estimate.items[::-1]:
+            if item.fullOffloaded:
+                continue
+
             if (
                 is_unified_memory
-                and (item.ram.uma > allocatable.ram - sum(g.uma for g in item.vrams))
+                and (item.ram.uma > (allocatable.ram - sum(g.uma for g in item.vrams)))
                 or (item.ram.nonuma > allocatable.ram)
             ):
                 continue
 
+            vram_not_matched = False
+            gpu_indexes = []
+            gpu_claims = {}
+            for vram_index, vram_claim in enumerate(item.vrams):
+                real_gpu_index = gpu_indexes_mapping[vram_index]
+                if (
+                    is_unified_memory
+                    and vram_claim.uma > allocatable.vram[real_gpu_index]
+                ) or (vram_claim.nonuma > allocatable.vram[real_gpu_index]):
+                    vram_not_matched = True
+                    break
+
+                gpu_indexes.append(real_gpu_index)
+                gpu_claims[real_gpu_index] = vram_claim.nonuma
+                if is_unified_memory:
+                    gpu_claims[real_gpu_index] = vram_claim.uma
+
+            if vram_not_matched:
+                continue
+
             final_offload_layers = item.offloadLayers
+            final_gpu_claims = gpu_claims
+            final_gpu_indexes = gpu_indexes
             final_ram_claim = item.ram.nonuma
             if is_unified_memory:
                 final_ram_claim = item.ram.uma
-
-            for index in range(len(item.vrams)):
-                real_gpu_index = gpu_indexes_mapping[index]
-                final_gpu_indexes.append(real_gpu_index)
-
-                final_gpu_claims[real_gpu_index] = item.vrams[index].nonuma
-                if is_unified_memory:
-                    final_gpu_claims[real_gpu_index] = item.vrams[index].uma
 
             break
 
@@ -532,10 +627,11 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                 vram=final_gpu_claims,
                 ram=final_ram_claim,
                 total_layers=total_layers,
+                tensor_split=tensor_splitting,
             ),
         )
 
-    async def _find_single_worker_multi_gpu_partial_offloading_candidates(
+    async def _find_single_worker_multi_gpu_partial_offloading_candidates(  # noqa: C901
         self, worker: Worker
     ) -> List[ModelInstanceScheduleCandidate]:
         """
@@ -547,7 +643,13 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         if total_gpu < 2:
             return []
 
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
+        if self._selected_gpu_ids_by_worker:
+            if worker.name not in self._selected_gpu_ids_by_worker:
+                return []
+            elif len(self._selected_gpu_ids_by_worker.get(worker.name)) < 2:
+                return []
+
+        allocatable = await self._get_worker_allocatable_resource(worker)
         gpu_combinations = await self._generate_combinations_for_worker_gpu(
             allocatable, worker
         )
@@ -606,7 +708,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         Find single worker without offloading candidates for the model instance.
         """
 
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
+        allocatable = await self._get_worker_allocatable_resource(worker)
         is_unified_memory = worker.status.memory.is_unified_memory
 
         result = await calculate_model_resource_claim(
@@ -652,7 +754,6 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         if not self._model.distributable:
             return []
 
-        # now single worker patial offloading has a higher priority than multi worker multi gpu.
         worker_map = {worker.id: worker for worker in workers}
         combinations, workers_allocatable, workers_gpus_allocatable = (
             await self._generate_combinations_for_worker_with_rpc_servers(workers)
@@ -699,7 +800,48 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         for i in range(2, total_gpu + 1):
             gpu_combinations[i] = list(itertools.combinations(sorted_gpus_memory, i))
 
+        if self._selected_gpu_ids_by_worker.get(worker.name):
+            filtered_gpu_combinations = (
+                self._filter_selected_combinations_for_worker_gpu(
+                    gpu_combinations, worker
+                )
+            )
+            gpu_combinations = filtered_gpu_combinations
+
+        # gpu_combinations examples:
+        # { 2: (($gpu_index, $gpu_allocatable), ($gpu_index, $gpu_allocatable))}
         return gpu_combinations
+
+    def _filter_selected_combinations_for_worker_gpu(
+        self, gpu_combinations: dict[Tuple[Tuple[int]]], worker: Worker
+    ) -> dict[Tuple[Tuple[int]]]:
+
+        index_device_type = {}
+        for device in worker.status.gpu_devices:
+            index_device_type[device.index] = device.type
+
+        filtered_gpu_combinations = {}
+        selected_worker_gpu_ids = sorted(
+            self._selected_gpu_ids_by_worker.get(worker.name)
+        )
+        selected_worker_gpu_count = len(selected_worker_gpu_ids)
+
+        filtered_gpu_combination = gpu_combinations.get(selected_worker_gpu_count)
+        if filtered_gpu_combination:
+            for fc in filtered_gpu_combination:
+                filtered_gpu_combination_ids = []
+                for gpu_vram in fc:
+                    gpu_type = index_device_type.get(gpu_vram[0])
+                    gpu_id = f"{worker.name}:{gpu_type}:{gpu_vram[0]}"
+                    filtered_gpu_combination_ids.append(gpu_id)
+
+                if selected_worker_gpu_ids == sorted(filtered_gpu_combination_ids):
+                    if selected_worker_gpu_count not in filtered_gpu_combinations:
+                        filtered_gpu_combinations[selected_worker_gpu_count] = []
+
+                    filtered_gpu_combinations[selected_worker_gpu_count].append(fc)
+
+        return filtered_gpu_combinations
 
     async def _generate_combinations_given_tensor_split(
         self,
@@ -734,17 +876,24 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         workers_allocatable = {}
         workers_allocatable_vram = []
         workers_gpus_allocatable = []
+
+        workers_allocatable_gpu_ids = {}
+        workers_gpu_indexes_type = {}
         for worker in workers:
             if not worker.status.gpu_devices:
                 continue
 
-            result = await get_worker_allocatable_resource(self._engine, worker)
+            result = await self._get_worker_allocatable_resource(worker)
             workers_allocatable[worker.id] = result
             worker_allocatable_vram = sum(result.vram.values())
             if worker_allocatable_vram > 0:
                 workers_allocatable_vram.append([worker.id, worker_allocatable_vram])
 
+            workers_allocatable_gpu_ids[worker.id] = []
             for gpu_device in worker.status.gpu_devices:
+                worker_gpu_index_key = f"{worker.id}:{gpu_device.index}"
+                workers_gpu_indexes_type[worker_gpu_index_key] = gpu_device.type
+
                 if gpu_device.index is None:
                     logger.warning(
                         f"gpu index is not found for {worker.name} {gpu_device.name}"
@@ -756,6 +905,9 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                         [worker.id, gpu_device.index, gpu_allocatable_vram]
                     )
 
+                    gpu_id = f"{worker.name}:{gpu_device.type}:{gpu_device.index}"
+                    workers_allocatable_gpu_ids[worker.id].append(gpu_id)
+
         sorted_workers = sorted(
             workers_allocatable_vram, key=lambda item: item[1], reverse=True
         )
@@ -764,7 +916,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         )
 
         combinations = {}
-        for i in range(1, (MAX_RPC_SERVER_COUNT + 1)):
+        for i in range(1, (self._max_rpc_server_count + 1)):
             c = [
                 (r, *v)
                 for r in sorted_workers
@@ -772,19 +924,65 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             ]
 
             combinations[i + 1] = [
-                r for r in c if all(r[0][0] != r[i][0] for i in range(1, len(r)))
+                r for r in c if all(r[0][0] != r[j][0] for j in range(1, len(r)))
             ]
+
+        if self._selected_gpu_ids:
+            filtered_combinations = (
+                self._filter_selected_combinations_for_worker_with_rpc_servers(
+                    combinations,
+                    workers_allocatable_gpu_ids,
+                    workers_gpu_indexes_type,
+                    workers,
+                )
+            )
+            combinations = filtered_combinations
 
         # combinations examples:
         # [( ($worker_id, $worker_allocatable_vram), ($worker_id, $gpu_index, $gpu_allocatable), ($worker_id, $gpu_index, $gpu_allocatable) )]
         return combinations, workers_allocatable, workers_gpus_allocatable
+
+    def _filter_selected_combinations_for_worker_with_rpc_servers(
+        self,
+        combinations: Dict,
+        workers_allocatable_gpu_ids,
+        workers_gpu_indexes_type,
+        workers: List[Worker],
+    ) -> Dict:
+        worker_map = {worker.id: worker for worker in workers}
+        filtered_combinations = {}
+        for count in combinations:
+            for combination in combinations[count]:
+                combination_gpu_ids = []
+
+                main_worker_id = combination[0][0]
+                main_worker_gpu_ids = workers_allocatable_gpu_ids.get(main_worker_id)
+                combination_gpu_ids.extend(main_worker_gpu_ids)
+
+                for i in range(1, len(combination)):
+                    rpc_worker_id = combination[i][0]
+                    rpc_worker_name = worker_map.get(rpc_worker_id).name
+
+                    rpc_key = f"{combination[i][0]}:{combination[i][1]}"
+                    rpc_gpu_type = workers_gpu_indexes_type.get(rpc_key)
+                    rpc_gpu_id = f"{rpc_worker_name}:{rpc_gpu_type}:{combination[i][1]}"
+
+                    combination_gpu_ids.append(rpc_gpu_id)
+
+                if sorted(combination_gpu_ids) == sorted(self._selected_gpu_ids):
+                    if count not in filtered_combinations:
+                        filtered_combinations[count] = []
+
+                    filtered_combinations[count].append(combination)
+
+        return filtered_combinations
 
     async def _check_combination_rpc_servers(
         self,
         combination,
         worker_map: Dict[int, Worker],
         e: memoryEstimate,
-        main_worker_gpu_indexes: List[int],
+        total_layers: int,
     ) -> List[ModelInstanceRPCServer]:
         """
         Check the rpc servers resource satisfied with combination.
@@ -818,7 +1016,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                         offload_layers=e.vrams[position].handleLayers,
                         vram={r_gpu_index: r_vram_claim},
                         ram=0,
-                        total_layers=e.offloadLayers,
+                        total_layers=total_layers,
                     ),
                 )
             )
@@ -911,7 +1109,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                 continue
 
             rpc_servers = await self._check_combination_rpc_servers(
-                combination, worker_map, e, main_worker_gpu_indexes
+                combination, worker_map, e, total_layers
             )
             if not rpc_servers:
                 continue
@@ -925,6 +1123,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                     vram=main_worker_vram_claim,
                     ram=main_worker_ram_claim,
                     total_layers=total_layers,
+                    tensor_split=flag_tensor_spliting,
                 ),
                 rpc_servers=rpc_servers,
             )

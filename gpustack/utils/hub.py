@@ -13,11 +13,14 @@ logger = logging.getLogger(__name__)
 
 
 def match_hugging_face_files(
-    repo_id: str, filename: str, extra_filename: Optional[str] = None
+    repo_id: str,
+    filename: str,
+    extra_filename: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> List[str]:
     validate_repo_id(repo_id)
 
-    hffs = HfFileSystem()
+    hffs = HfFileSystem(token=token)
 
     files = [
         file["name"] if isinstance(file, dict) else file
@@ -56,7 +59,7 @@ def match_model_scope_file_paths(
         root = None
 
     api = HubApi()
-    files = api.get_model_files(model_id, root=root)
+    files = api.get_model_files(model_id, root=root, recursive=True)
 
     file_paths = [file["Path"] for file in files]
     matching_paths = [p for p in file_paths if fnmatch.fnmatch(p, file_path)]
@@ -77,7 +80,7 @@ def match_model_scope_file_paths(
     return matching_paths
 
 
-def get_pretrained_config(model: Model):
+def get_pretrained_config(model: Model, **kwargs):
     """
     Get the pretrained config of the model from Hugging Face or ModelScope.
     Args:
@@ -85,7 +88,9 @@ def get_pretrained_config(model: Model):
     """
 
     trust_remote_code = False
-    if model.backend_parameters and "--trust-remote-code" in model.backend_parameters:
+    if (
+        model.backend_parameters and "--trust-remote-code" in model.backend_parameters
+    ) or kwargs.get("trust_remote_code"):
         trust_remote_code = True
 
     global_config = get_global_config()

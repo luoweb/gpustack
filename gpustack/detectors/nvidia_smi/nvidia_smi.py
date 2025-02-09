@@ -10,6 +10,7 @@ from gpustack.schemas.workers import (
 )
 from gpustack.utils import platform
 from gpustack.utils.command import is_command_available
+from gpustack.utils.convert import safe_float, safe_int
 
 
 class NvidiaSMI(GPUDetector):
@@ -40,15 +41,20 @@ class NvidiaSMI(GPUDetector):
             index, name, memory_total, memory_used, utilization_gpu, temperature_gpu = (
                 row
             )
+
+            index = safe_int(index)
+            name = name.strip()
             # Convert MiB to bytes
-            memory_total = int(memory_total.split()[0]) * 1024 * 1024
+            memory_total = safe_int(memory_total.split()[0]) * 1024 * 1024
             # Convert MiB to bytes
-            memory_used = int(memory_used.split()[0]) * 1024 * 1024
-            utilization_gpu = float(utilization_gpu.split()[0])  # Remove the '%' sign
-            temperature_gpu = float(temperature_gpu)
+            memory_used = safe_int(memory_used.split()[0]) * 1024 * 1024
+            utilization_gpu = safe_float(
+                utilization_gpu.split()[0]
+            )  # Remove the '%' sign
+            temperature_gpu = safe_float(temperature_gpu)
 
             device = GPUDeviceInfo(
-                index=int(index),
+                index=index,
                 name=name,
                 vendor=VendorEnum.NVIDIA.value,
                 memory=MemoryInfo(

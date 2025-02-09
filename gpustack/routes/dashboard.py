@@ -1,7 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 from typing import List
 from fastapi import APIRouter
-from sqlalchemy import BigInteger
+from sqlalchemy import JSON, BigInteger, case, cast, text
 from sqlmodel import distinct, select, func
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -219,6 +219,7 @@ async def get_active_models(session: AsyncSession) -> List[ModelSummary]:
             ModelSummary(
                 id=result.id,
                 name=result.name,
+                categories=result.categories,
                 resource_claim=ResourceClaim(
                     ram=result.total_ram_claim,
                     vram=result.total_vram_claim,
@@ -248,11 +249,23 @@ def active_model_statement() -> select:
         )
     elif dialect == 'postgresql':
         vram_values = func.json_each_text(
-            ModelInstance.computed_resource_claim['vram']
+            case(
+                (
+                    func.json_typeof(ModelInstance.computed_resource_claim['vram'])
+                    == text("'object'"),
+                    ModelInstance.computed_resource_claim['vram'],
+                ),
+                else_=cast({"0": 0}, JSON),
+            )
         ).table_valued('value')
 
         ram_claim = func.cast(
-            func.json_extract_path_text(ModelInstance.computed_resource_claim, 'ram'),
+            func.coalesce(
+                func.json_extract_path_text(
+                    ModelInstance.computed_resource_claim, 'ram'
+                ),
+                '0',
+            ),
             BigInteger,
         )
     else:
@@ -283,6 +296,7 @@ def active_model_statement() -> select:
         select(
             Model.id,
             Model.name,
+            Model.categories,
             func.count(distinct(ModelInstance.id)).label('instance_count'),
             func.coalesce(resource_claim_query.c.total_ram_claim, 0).label(
                 'total_ram_claim'
@@ -304,7 +318,7 @@ def active_model_statement() -> select:
             resource_claim_query.c.total_ram_claim,
             resource_claim_query.c.total_vram_claim,
         )
-        .order_by(usage_sum_query.c.total_token_count.desc())
+        .order_by(func.coalesce(usage_sum_query.c.total_token_count, 0).desc())
         .limit(10)
     )
 

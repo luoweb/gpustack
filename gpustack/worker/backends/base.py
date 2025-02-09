@@ -17,7 +17,7 @@ from gpustack.schemas.models import (
     SourceEnum,
     ModelInstanceStateEnum,
     get_backend,
-    get_extra_filename,
+    get_mmproj_filename,
 )
 from gpustack.schemas.workers import VendorEnum, GPUDevicesInfo
 from gpustack.utils import platform
@@ -35,6 +35,7 @@ ACCELERATOR_VENDOR_TO_ENV_NAME = {
     VendorEnum.NVIDIA: "CUDA_VISIBLE_DEVICES",
     VendorEnum.Huawei: "ASCEND_RT_VISIBLE_DEVICES",
     VendorEnum.AMD: "ROCR_VISIBLE_DEVICES",
+    VendorEnum.Hygon: "HIP_VISIBLE_DEVICES",
 }
 
 
@@ -79,7 +80,7 @@ def download_model(
         return HfDownloader.download(
             repo_id=model.huggingface_repo_id,
             filename=model.huggingface_filename,
-            extra_filename=get_extra_filename(model),
+            extra_filename=get_mmproj_filename(model),
             token=huggingface_token,
             cache_dir=os.path.join(cache_dir, "huggingface"),
         )
@@ -95,7 +96,7 @@ def download_model(
         return ModelScopeDownloader.download(
             model_id=model.model_scope_model_id,
             file_path=model.model_scope_file_path,
-            extra_file_path=get_extra_filename(model),
+            extra_file_path=get_mmproj_filename(model),
             cache_dir=os.path.join(cache_dir, "model_scope"),
         )
     elif model.source == SourceEnum.LOCAL_PATH:
@@ -150,7 +151,7 @@ class InferenceServer(ABC):
             self._clientset = clientset
             self._model_instance = mi
             self._config = cfg
-            self._model = self._clientset.models.get(id=mi.model_id)
+            self.get_model()
 
             model_file_size = get_model_file_size(self._model, cfg)
             if model_file_size:
@@ -208,6 +209,20 @@ class InferenceServer(ABC):
     @abstractmethod
     def start(self):
         pass
+
+    def get_model(self):
+        model = self._clientset.models.get(id=self._model_instance.model_id)
+        data_dir = self._config.data_dir
+        for i, param in enumerate(model.backend_parameters):
+            model.backend_parameters[i] = param.replace("{data_dir}", data_dir)
+
+        self._model = model
+
+    def exit_with_code(self, exit_code: int):
+        if exit_code < 0:
+            signal_number = -exit_code
+            exit_code = 128 + signal_number
+        sys.exit(exit_code)
 
     def hijack_tqdm_progress(server_self):
         """

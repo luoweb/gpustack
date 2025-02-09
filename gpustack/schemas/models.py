@@ -21,6 +21,15 @@ class SourceEnum(str, Enum):
     LOCAL_PATH = "local_path"
 
 
+class CategoryEnum(str, Enum):
+    LLM = "llm"
+    EMBEDDING = "embedding"
+    IMAGE = "image"
+    RERANKER = "reranker"
+    SPEECH_TO_TEXT = "speech_to_text"
+    TEXT_TO_SPEECH = "text_to_speech"
+
+
 class PlacementStrategyEnum(str, Enum):
     SPREAD = "spread"
     BINPACK = "binpack"
@@ -183,6 +192,7 @@ class ModelInstanceStateEnum(str, Enum):
     ERROR = "error"
     DOWNLOADING = "downloading"
     ANALYZING = "analyzing"
+    UNREACHABLE = "unreachable"
 
 
 class ComputedResourceClaim(BaseModel):
@@ -191,6 +201,7 @@ class ComputedResourceClaim(BaseModel):
     total_layers: Optional[int] = None
     ram: Optional[int] = Field(default=None)  # in bytes
     vram: Optional[Dict[int, int]] = Field(default=None)  # in bytes
+    tensor_split: Optional[List[int]] = Field(default=None)
 
 
 class ModelInstanceRPCServer(RPCServer):
@@ -320,6 +331,15 @@ def is_image_model(model: Model):
     return "image" in model.categories
 
 
+def is_embedding_model(model: Model):
+    """
+    Check if the model is an embedding model.
+    Args:
+        model: Model to check.
+    """
+    return "embedding" in model.categories
+
+
 def is_renaker_model(model: Model):
     """
     Check if the model is a reranker model.
@@ -342,9 +362,10 @@ def get_backend(model: Model) -> str:
     return BackendEnum.VLLM
 
 
-def get_extra_filename(model: Model) -> Optional[str]:
+def get_mmproj_filename(model: Model) -> Optional[str]:
     """
-    Get extra filename for the model. Currently mainly used for grabbing the mmproj file for VLMs.
+    Get the mmproj filename for the model. If the mmproj is not provided in the model's
+    backend parameters, it will try to find the default mmproj file.
     """
     if get_backend(model) != BackendEnum.LLAMA_BOX:
         return None
