@@ -1,4 +1,5 @@
 #!/bin/sh
+# Script updated at: 2025-02-19T08:16:49Z
 set -e
 set -o noglob
 
@@ -30,7 +31,7 @@ set -o noglob
 INSTALL_PACKAGE_SPEC="${INSTALL_PACKAGE_SPEC:-}"
 INSTALL_INDEX_URL="${INSTALL_INDEX_URL:-}"
 INSTALL_SKIP_POST_CHECK="${INSTALL_SKIP_POST_CHECK:-0}"
-INSTALL_SKIP_BUILD_DEPENDENCIES="${INSTALL_SKIP_BUILD_DEPENDENCIES:-0}"
+INSTALL_SKIP_BUILD_DEPENDENCIES="${INSTALL_SKIP_BUILD_DEPENDENCIES:-1}"
 
 BREW_APP_OPENFST_NAME="openfst"
 BREW_APP_OPENFST_VERSION="1.8.3"
@@ -77,11 +78,14 @@ get_param_value() {
     echo ""
 }
 
+check_command() {
+  command -v "$1" > /dev/null 2>&1
+}
+
 ACTION="Install"
 print_complete_message()
 {
     usage_hint=""
-    path_hint=""
     if [ "$ACTION" = "Install" ]; then
         data_dir=$(get_param_value "data-dir" "$@")
         if [ -z "$data_dir" ]; then
@@ -114,16 +118,14 @@ print_complete_message()
             password_hint=""
             bootstrap_password=$(get_param_value "bootstrap-password" "$@")
             if [ -z "$bootstrap_password" ]; then
-                password_hint="To get the default password, run 'cat $data_dir/initial_admin_password'.\n"
+                password_hint="To get the default password, run 'cat $data_dir/initial_admin_password'."
             fi
 
             usage_hint="\n\nGPUStack UI is available at $server_url.\nDefault username is 'admin'.\n${password_hint}\n"
         fi
 
-
-        path_hint="CLI \"gpustack\" is available from the command line. (You may need to open a new terminal or re-login for the PATH changes to take effect.)"
     fi
-    info "$ACTION complete. ${usage_hint}${path_hint}"
+    info "$ACTION complete. ${usage_hint}"
 }
 
 # --- fatal if no systemd or launchd ---
@@ -141,7 +143,7 @@ verify_system() {
 SUDO=
 check_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
+    if check_command "sudo"; then
       info "running as non-root, will use sudo for installation."
       SUDO="sudo"
     else
@@ -165,25 +167,70 @@ detect_os() {
 
 # Function to detect the OS and package manager
 detect_device() {
-  if command -v nvidia-smi > /dev/null 2>&1; then
-    if ! command -v nvcc > /dev/null 2>&1 && ! ($SUDO ldconfig -p | grep -q libcudart) && ! ls /usr/local/cuda >/dev/null 2>&1; then
+  if check_command "nvidia-smi"; then
+    if ! check_command "nvcc" && ! ($SUDO ldconfig -p | grep -q libcudart) && ! ls /usr/local/cuda >/dev/null 2>&1; then
       warn "NVIDIA GPU detected but CUDA is not installed. Please install CUDA."
     fi
     DEVICE="cuda"
   fi
 
-  if command -v mthreads-gmi > /dev/null 2>&1; then
-    if ! command -v mcc > /dev/null 2>&1 && ! ($SUDO ldconfig -p | grep -q libmusart) && ! ls /usr/local/musa >/dev/null 2>&1 && ! ls /opt/musa >/dev/null 2>&1; then
+  if check_command "mthreads-gmi"; then
+    if ! check_command "mcc" && ! ($SUDO ldconfig -p | grep -q libmusart) && ! ls /usr/local/musa >/dev/null 2>&1 && ! ls /opt/musa >/dev/null 2>&1; then
       warn "Moore Threads GPU detected but MUSA is not installed. Please install MUSA."
     fi
     DEVICE="musa"
   fi
 }
 
+# Function to check if a port is available
+check_port() {
+  port=$1
+  if $SUDO lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+# Function to check if the server and worker ports are available
+check_ports() {
+  if check_command "gpustack"; then
+    # skip on upgrade
+    return
+  fi
+
+  config_file=$(get_param_value "config-file" "$@")
+  if [ -n "$config_file" ]; then
+    return
+  fi
+
+  server_port=$(get_param_value "port" "$@")
+  worker_port=$(get_param_value "worker-port" "$@")
+  ssl_enabled=$(get_param_value "ssl-keyfile" "$@")
+
+  if [ -z "$server_port" ]; then
+    server_port="80"
+    if [ -n "$ssl_enabled" ]; then
+      server_port="443"
+    fi
+  fi
+
+  if [ -z "$worker_port" ]; then
+    worker_port="10150"
+  fi
+
+  if ! check_port "$server_port"; then
+    fatal "Server port $server_port is already in use! Please specify a different port by using --port <YOUR_PORT>."
+  fi
+
+  if ! check_port "$worker_port"; then
+    fatal "Worker port $worker_port is already in use! Please specify a different port by using --worker-port <YOUR_PORT>."
+  fi
+}
+
 # Function to check and install Python tools
 PYTHONPATH=""
 check_python_tools() {
-  if ! command -v python3 > /dev/null 2>&1; then
+  if ! check_command "python3"; then
     info "Python3 could not be found. Attempting to install..."
     if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
       $SUDO apt update && $SUDO DEBIAN_FRONTEND=noninteractive apt install -y python3
@@ -219,7 +266,7 @@ check_python_tools() {
       fi
     fi
 
-    if ! command -v pip3 > /dev/null 2>&1; then
+    if ! check_command "pip3"; then
       info "Pip3 could not be found. Attempting to ensure pip..."
       if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
         if python3 -m ensurepip 2>&1 | grep -q "ensurepip is disabled"; then
@@ -239,10 +286,10 @@ check_python_tools() {
     fi
   fi
 
-  USER_BASE_BIN=$(python3 -m site --user-base)/bin
+  USER_BASE_BIN=$(python3 -m site --user-base || true)/bin
   export PATH="$USER_BASE_BIN:$PATH"
 
-  if ! command -v pipx > /dev/null 2>&1; then
+  if ! check_command "pipx"; then
     info "Pipx could not be found. Attempting to install..."
     if [ -z "$PYTHON_EXTERNALLY_MANAGED" ]; then
       pip3 install pipx
@@ -329,24 +376,24 @@ brew_install_with_version() {
 
 # Function to install dependencies
 install_dependencies() {
-  DEPENDENCIES="curl sudo"
+  DEPENDENCIES="curl sudo lsof"
   for dep in $DEPENDENCIES; do
-    if ! command -v "$dep" > /dev/null 2>&1; then
+    if ! check_command "$dep"; then
       fatal "$dep is required but missing. Please install $dep."
     fi
   done
 
   # check SeLinux dependency
-  if command -v getenforce > /dev/null 2>&1; then
+  if check_command "getenforce"; then
       if [ "Disabled" != "$(getenforce)" ]; then
-          if ! command -v semanage > /dev/null 2>&1; then
+          if ! check_command "semanage"; then
               fatal "semanage is required while SeLinux enabled but missing. Please install the appropriate package for your OS (e.g., policycoreutils-python-utils for Rocky/RHEL/Ubuntu/Debian)."
           fi
       fi
   fi
 
   if [ "$INSTALL_SKIP_BUILD_DEPENDENCIES" != "1" ] && [ "$OS" = "macos" ]; then
-    if ! command -v brew > /dev/null 2>&1; then
+    if ! check_command "brew"; then
       fatal "Homebrew is required but missing. Please install Homebrew."
     else
       # audio dependency library
@@ -378,7 +425,7 @@ setup_selinux_permissions() {
 # Function to setup systemd for Linux
 setup_systemd() {
   # setup permissions
-  if command -v getenforce > /dev/null 2>&1; then
+  if check_command "getenforce"; then
       if [ "Disabled" != "$(getenforce)" ]; then
           info "Setting up SeLinux permissions for Python3."
           PYTHON3_BIN_PATH=$(which python3)
@@ -620,7 +667,7 @@ EOF
 
 # Function to install GPUStack using pipx
 install_gpustack() {
-  if command -v gpustack > /dev/null 2>&1; then
+  if check_command "gpustack"; then
     ACTION="Upgrade"
     info "GPUStack is already installed. Upgrading..."
   else
@@ -668,6 +715,7 @@ install_gpustack() {
   verify_system
   install_dependencies
   check_python_tools
+  check_ports "$@"
   install_gpustack
   create_uninstall_script
   disable_service

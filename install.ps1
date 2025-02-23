@@ -16,6 +16,8 @@
     You can add additional workers to form a GPUStack cluster by running the command on worker nodes.
 #>
 
+# Script updated at: 2025-02-19T08:16:49Z
+
 $ErrorActionPreference = "Stop"
 
 $INSTALL_PACKAGE_SPEC = if ($env:INSTALL_PACKAGE_SPEC) { $env:INSTALL_PACKAGE_SPEC } else { "gpustack[audio]" }
@@ -129,6 +131,60 @@ function Get-Arg-Value {
     return ""
 }
 
+# Function to check if a port is available
+function Check-PortAvailability {
+    param([int]$Port)
+
+    $connection = Get-NetTCPConnection -LocalPort $Port -LocalAddress '0.0.0.0' -State 'Listen' -ErrorAction SilentlyContinue
+
+    if ($connection) {
+        return $false  # Port is in use
+    }
+    else {
+        return $true   # Port is available
+    }
+}
+
+# Function to check if the server and worker ports are available
+function Check-Port {
+    param (
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$ScriptArgs
+    )
+    if (Get-Command gpustack -ErrorAction SilentlyContinue) {
+        # skip on upgrade
+        return
+    }
+
+    $configFile = Get-Arg-Value -ArgName "config-file" @ScriptArgs
+    if ($configFile) {
+        return
+    }
+
+    $serverPort = Get-Arg-Value -ArgName "port" @ScriptArgs
+    $workerPort = Get-Arg-Value -ArgName "worker-port" @ScriptArgs
+    $sslEnabled = Get-Arg-Value -ArgName "ssl-keyfile" @ScriptArgs
+
+    if (-not $serverPort) {
+        $serverPort = 80
+        if ($sslEnabled) {
+            $serverPort = 443
+        }
+    }
+
+    if (-not $workerPort) {
+        $workerPort = 10150
+    }
+
+    if (-not (Check-PortAvailability -Port $serverPort)) {
+        throw "Server port $serverPort is already in use! Please specify a different port by using --port <YOUR_PORT>."
+    }
+
+    if (-not (Check-PortAvailability -Port $workerPort)) {
+        throw "Worker port $workerPort is already in use! Please specify a different port by using --worker-port <YOUR_PORT>."
+    }
+}
+
 # Function to print completion message.
 function Print-Complete-Message {
     param (
@@ -136,7 +192,7 @@ function Print-Complete-Message {
         [string[]]$ScriptArgs
     )
     $usageHint = ""
-    $pathHint = ""
+    $firewallHint = ""
     if ($ACTION -eq "Install") {
         $dataDir = Get-Arg-Value -ArgName "data-dir" @ScriptArgs
         if ([string]::IsNullOrEmpty($dataDir)) {
@@ -177,11 +233,11 @@ function Print-Complete-Message {
 
             $usageHint = "`n`nGPUStack UI is available at ${serverUrl}.`nDefault username is 'admin'.`n${passwordHint}`n"
         }
-        $pathHint = "CLI 'gpustack' is available from the command line."
+        $firewallHint = "Note: The Windows firewall may be enabled, and you may need to add rules to allow access."
     }
 
 
-    Write-Host "$ACTION complete. ${usageHint}${pathHint}"
+    Write-Host "$ACTION complete. ${usageHint}${firewallHint}"
 }
 
 function Refresh-ChocolateyProfile {
@@ -416,7 +472,7 @@ function Install-GPUStack {
             Log-Info "Path already contains $pipEnv"
         }
 
-        Log-Info "$ACTION GPUStack success."
+        Log-Info "$ACTION GPUStack successfully."
     }
     catch {
         throw "Failed to $ACTION GPUStack: `"$($_.Exception.Message)`""
@@ -432,7 +488,7 @@ function Stop-GPUStackService {
             Log-Info "Stopping existing ${serviceName} service..."
             $result = nssm stop $serviceName confirm
             if ($LASTEXITCODE -eq 0) {
-                Log-Info "Stopped existing ${serviceName} success"
+                Log-Info "Stopped existing ${serviceName} successfully"
             }
             else {
                 Log-Warn "Failed to stop existing ${serviceName} service: `"$($result)`""
@@ -440,7 +496,7 @@ function Stop-GPUStackService {
 
             $result = nssm remove $serviceName confirm
             if ($LASTEXITCODE -eq 0) {
-                Log-Info "Removed existing ${serviceName} success"
+                Log-Info "Removed existing ${serviceName} successfully"
             }
             else {
                 Log-Warn "Failed to remove existing ${serviceName} service: `"$($result)`""
@@ -676,7 +732,7 @@ function Uninstall-GPUStack {
                 Log-Info "Stopping existing ${serviceName} service..."
                 $result = nssm stop $serviceName confirm
                 if ($LASTEXITCODE -eq 0) {
-                    Log-Info "Stopped ${serviceName} success"
+                    Log-Info "Stopped ${serviceName} successfully"
                 }
                 else {
                     Log-Warn "Failed to stop existing ${serviceName} service: `"$($result)`""
@@ -684,7 +740,7 @@ function Uninstall-GPUStack {
 
                 $result = nssm remove $serviceName confirm
                 if ($LASTEXITCODE -eq 0) {
-                    Log-Info "Removed ${serviceName} success"
+                    Log-Info "Removed ${serviceName} successfully"
                 }
                 else {
                     Log-Warn "Failed to remove existing ${serviceName} service: `"$($result)`""
@@ -707,7 +763,7 @@ function Uninstall-GPUStack {
         $pipxPackages = pipx list
         if ($pipxPackages -like '*gpustack*') {
             pipx uninstall gpustack
-            Log-Info "Uninstalled package ${packageName} success."
+            Log-Info "Uninstalled package ${packageName} successfully."
         }
         else {
             Log-Info "Package ${packageName} is not installed."
@@ -760,6 +816,7 @@ try {
     Check-AdminPrivilege
     Check-OS
     Check-CUDA
+    Check-Port @args
     Install-Chocolatey
     Install-Python
     Install-NSSM

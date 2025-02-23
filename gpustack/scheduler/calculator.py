@@ -173,6 +173,8 @@ async def _gguf_parser_command(  # noqa: C901
         "--image-vae-tiling",
         "--cache-expiration",
         "168h0m0s",
+        "--platform-footprint",
+        "150,500",
         "--no-mmap",
         "--json",
     ]
@@ -201,6 +203,13 @@ async def _gguf_parser_command(  # noqa: C901
         execuable_command,
         "--image-no-vae-tiling",
     )
+    add_bool_flag(
+        model.backend_parameters,
+        ["flash-attention", "flash-attn", "fa", "diffusion-fa"],
+        execuable_command,
+        "--flash-attention",
+    )
+
     add_parameter_with_value(
         model.backend_parameters,
         ["image-max-height"],
@@ -218,6 +227,42 @@ async def _gguf_parser_command(  # noqa: C901
         ["visual-max-image-size"],
         execuable_command,
         "--visual-max-image-size",
+    )
+    add_parameter_with_value(
+        model.backend_parameters,
+        ["cache-type-k", "ctk"],
+        execuable_command,
+        "--cache-type-k",
+    )
+    add_parameter_with_value(
+        model.backend_parameters,
+        ["cache-type-v", "ctv"],
+        execuable_command,
+        "--cache-type-v",
+    )
+    add_parameter_with_value(
+        model.backend_parameters,
+        ["batch-size", "b"],
+        execuable_command,
+        "--batch-size",
+    )
+    add_parameter_with_value(
+        model.backend_parameters,
+        ["ubatch-size", "ub"],
+        execuable_command,
+        "--ubatch-size",
+    )
+    add_parameter_with_value(
+        model.backend_parameters,
+        ["split-mode", "sm"],
+        execuable_command,
+        "--split-mode",
+    )
+    add_parameter_with_value(
+        model.backend_parameters,
+        ["platform-footprint"],
+        execuable_command,
+        "--platform-footprint",
     )
 
     cache_dir = kwargs.get("cache_dir")
@@ -297,18 +342,18 @@ async def calculate_model_resource_claim(
         claim: modelResoruceClaim = modelResoruceClaim.from_json(cmd_output)
 
         if offload == GPUOffloadEnum.Full:
-            logger.info(
+            logger.debug(
                 f"Calculated resource claim for full offload model instance {model_instance.name}, "
                 f"{claim.estimate.items[0].to_log_string()}"
             )
         elif offload == GPUOffloadEnum.Partial:
-            logger.info(
+            logger.debug(
                 f"Calculated resource claim for partial offloading model instance {model_instance.name}, \n"
                 f"  Least: {claim.estimate.items[1].to_log_string()} \n"
                 f"  Most: {claim.estimate.items[len(claim.estimate.items) - 2].to_log_string()}"
             )
         elif offload == GPUOffloadEnum.Disable:
-            logger.info(
+            logger.debug(
                 f"Calculated resource claim for disabled offloading model instance {model_instance.name}, "
                 f"{claim.estimate.items[0].to_log_string()}"
             )
