@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 from dataclasses import dataclass
+import time
 from typing import List, Optional
 from dataclasses_json import dataclass_json
 
@@ -152,6 +153,15 @@ def add_parameter_with_value(
         value = find_parameter(parameters, keys)
         if value:
             command_list.extend([flag_name, value])
+
+
+def _gguf_parser_env(model: Model) -> dict:
+    env = os.environ.copy()
+    if model.source == SourceEnum.HUGGING_FACE:
+        global_config = get_global_config()
+        if global_config.huggingface_token:
+            env["HF_TOKEN"] = str(global_config.huggingface_token)
+    return env
 
 
 async def _gguf_parser_command(  # noqa: C901
@@ -320,13 +330,17 @@ async def calculate_model_resource_claim(
             estimate = _get_empty_estimate(n_gpu=len(tensor_split))
         return ModelInstanceResourceClaim(model_instance, estimate)
 
-    logger.debug(f"Calculating resource claim for model instance {model_instance.name}")
-
     command = await _gguf_parser_command(model, offload, **kwargs)
+    env = _gguf_parser_env(model)
     try:
+        start_time = time.time()
+        logger.trace(
+            f"Running parser for model instance {model_instance.name} with command: {' '.join(map(str, command))}"
+        )
+
         process = await asyncio.create_subprocess_exec(
             *command,
-            env=os.environ.copy(),
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -340,21 +354,21 @@ async def calculate_model_resource_claim(
 
         cmd_output = stdout.decode()
         claim: modelResoruceClaim = modelResoruceClaim.from_json(cmd_output)
+        latency = time.time() - start_time
 
         if offload == GPUOffloadEnum.Full:
-            logger.debug(
-                f"Calculated resource claim for full offload model instance {model_instance.name}, "
+            logger.trace(
+                f"Finished running parser for full offload model instance {model_instance.name}, latency: {latency:.2f}, "
                 f"{claim.estimate.items[0].to_log_string()}"
             )
         elif offload == GPUOffloadEnum.Partial:
-            logger.debug(
-                f"Calculated resource claim for partial offloading model instance {model_instance.name}, \n"
-                f"  Least: {claim.estimate.items[1].to_log_string()} \n"
-                f"  Most: {claim.estimate.items[len(claim.estimate.items) - 2].to_log_string()}"
+            logger.trace(
+                f"Finished running parser for partial offloading model instance {model_instance.name}, latency: {latency:.2f}, at least: "
+                f"{claim.estimate.items[1].to_log_string() if len(claim.estimate.items) > 1 else claim.estimate.items[0].to_log_string()}"
             )
         elif offload == GPUOffloadEnum.Disable:
-            logger.debug(
-                f"Calculated resource claim for disabled offloading model instance {model_instance.name}, "
+            logger.trace(
+                f"Finished running parser for disabled offloading model instance {model_instance.name}, latency: {latency:.2f}, "
                 f"{claim.estimate.items[0].to_log_string()}"
             )
             clear_vram_claim(claim)
@@ -432,9 +446,6 @@ async def _gguf_parser_command_args_from_source(  # noqa: C901
                 )
                 if mmproj_filename:
                     args.extend(["--hf-mmproj-file", mmproj_filename])
-
-            if global_config.huggingface_token:
-                args.extend(["-hf-token", global_config.huggingface_token])
 
             return args
         elif model.source == SourceEnum.MODEL_SCOPE:
