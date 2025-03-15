@@ -1,10 +1,8 @@
 import tempfile
 import shutil
-from typing import List
 import pytest
 from gpustack.config.config import Config
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
-from gpustack.policies.base import ModelInstanceScheduleCandidate
 from gpustack.policies.candidate_selectors.gguf_resource_fit_selector import (
     GGUFResourceFitSelector,
 )
@@ -50,6 +48,8 @@ from tests.fixtures.estimates.fixtures import (
     deepseek_r1_q4_k_m_partial_offload,
     deepseek_r1_q4_k_m_partial_offload_split_1main_1rpc,
     deepseek_r1_q4_k_m_partial_offload_split_6,
+    deepseek_r1_ud_iq2_xxs_full_offload,
+    deepseek_r1_ud_iq2_xxs_full_offload_split_8,
     deepseek_r1_ud_iq2_xxs_partial_offload,
     deepseek_r1_ud_iq2_xxs_partial_offload_split_2,
     deepseek_r1_ud_iq2_xxs_partial_offload_split_3,
@@ -59,6 +59,8 @@ from tests.fixtures.estimates.fixtures import (
     deepseek_r1_ud_iq2_xxs_partial_offload_split_7,
     deepseek_r1_ud_iq2_xxs_partial_offload_split_8,
     llama3_70b_disable_offload,
+    llama3_70b_full_offload,
+    llama3_70b_full_offload_split_2_4080,
     llama3_70b_partial_offload,
     llama3_70b_partial_offload_split_2_4080_4090,
     llama3_70b_partial_offload_split_2_4080,
@@ -77,6 +79,7 @@ from tests.fixtures.estimates.fixtures import (
 from unittest.mock import patch, AsyncMock
 
 from tests.utils.model import new_model, new_model_instance
+from tests.utils.scheduler import compare_candidates
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -143,7 +146,26 @@ async def test_schedule_to_single_worker_single_gpu(config):
         candidate, _ = await scheduler.find_candidate(mi, m, workers)
 
         expected_candidates = [
-            # non uma
+            {
+                "offload_layers": 33,
+                "worker_id": 2,
+                "worker_name": "host4090",
+                "gpu_indexes": [0],
+                "is_unified_memory": False,
+                "ram": 337237976,
+                "vram": {0: 6315049984},
+                "score": 16.350315512573545,
+            },
+            {
+                "offload_layers": 33,
+                "worker_id": 1,
+                "worker_name": "hostmacosmetal",
+                "gpu_indexes": [0],
+                "is_unified_memory": True,
+                "ram": 179951576,
+                "vram": {0: 1074271232},
+                "score": 3.3011152944948687,
+            },
             {
                 "offload_layers": 33,
                 "worker_id": 3,
@@ -164,31 +186,10 @@ async def test_schedule_to_single_worker_single_gpu(config):
                 "vram": {1: 6315049984},
                 "score": 24.68491284676514,
             },
-            {
-                "offload_layers": 33,
-                "worker_id": 2,
-                "worker_name": "host4090",
-                "gpu_indexes": [0],
-                "is_unified_memory": False,
-                "ram": 337237976,
-                "vram": {0: 6315049984},
-                "score": 16.350315512573545,
-            },
-            # uma
-            {
-                "offload_layers": 33,
-                "worker_id": 1,
-                "worker_name": "hostmacosmetal",
-                "gpu_indexes": [0],
-                "is_unified_memory": True,
-                "ram": 179951576,
-                "vram": {0: 1074271232},
-                "score": 3.3011152944948687,
-            },
         ]
 
         assert len(candidates) == 4
-        assert candidate == candidates[0]
+        assert candidate == candidates[2]
         compare_candidates(candidates, expected_candidates)
 
 
@@ -655,25 +656,25 @@ async def test_schedule_to_cpu_with_binpack_spread(config):
             {
                 "offload_layers": 0,
                 "total_layers": 81,
-                "worker_id": 6,
-                "worker_name": "host-cpu-1",
-                "is_unified_memory": False,
-                "ram": 3106511032,
-                "score": 8.5093054482,
-            },
-            {
-                "offload_layers": 0,
-                "total_layers": 81,
                 "worker_id": 7,
                 "worker_name": "host-cpu-2",
                 "is_unified_memory": False,
                 "ram": 3106511032,
                 "score": 2.4518337732,
             },
+            {
+                "offload_layers": 0,
+                "total_layers": 81,
+                "worker_id": 6,
+                "worker_name": "host-cpu-1",
+                "is_unified_memory": False,
+                "ram": 3106511032,
+                "score": 8.5093054482,
+            },
         ]
 
         assert len(binpack_candidates) == 2
-        assert binpack_candidate == binpack_candidates[0]
+        assert binpack_candidate == binpack_candidates[1]
         compare_candidates(binpack_candidates, expected_candidates)
 
         # spread
@@ -689,12 +690,12 @@ async def test_schedule_to_cpu_with_binpack_spread(config):
         spread_candidate, _ = await scheduler.find_candidate(mi_spread, m, workers)
 
         expected_spread_candidates = [
-            {"worker_id": 6, "score": 83.3333333333},
             {"worker_id": 7, "score": 85.0},
+            {"worker_id": 6, "score": 83.3333333333},
         ]
 
         assert len(spread_candidates) == 2
-        assert spread_candidate == spread_candidates[1]
+        assert spread_candidate == spread_candidates[0]
         compare_candidates(spread_candidates, expected_spread_candidates)
 
 
@@ -1285,7 +1286,7 @@ async def test_manual_schedule_to_single_worker_multi_gpu_partial_offload(config
         compare_candidates(candidates, expected_candidates)
 
 
-def mock_calculate_model_resource_claim(
+def mock_calculate_model_resource_claim(  # noqa: C901
     model_instance: ModelInstance,
     model: Model,
     offload: GPUOffloadEnum = GPUOffloadEnum.Full,
@@ -1293,6 +1294,21 @@ def mock_calculate_model_resource_claim(
 ) -> ModelInstanceResourceClaim:
     mock_estimate = AsyncMock()
     tensor_split = kwargs.get("tensor_split")
+    if offload == GPUOffloadEnum.Full:
+        if model.ollama_library_model_name == "llama3:70b":
+            mock_estimate = llama3_70b_full_offload()
+            if tensor_split:
+                mapping = {
+                    (
+                        1,
+                        1,
+                    ): llama3_70b_full_offload_split_2_4080,
+                    (
+                        17171480576,
+                        17171480576,
+                    ): llama3_70b_full_offload_split_2_4080,
+                }
+                mock_estimate = mapping[tuple(tensor_split)]()
     if offload == GPUOffloadEnum.Partial:
         if model.ollama_library_model_name == "llama3:70b":
             mock_estimate = llama3_70b_partial_offload()
@@ -1373,6 +1389,23 @@ def mock_calculate_model_resource_claim_for_deepseek_r1(  # noqa: C901
 ) -> ModelInstanceResourceClaim:
     mock_estimate = AsyncMock()
     tensor_split = kwargs.get("tensor_split")
+    if offload == GPUOffloadEnum.Full:
+        if "deepseek-r1-ud-iq2_xxs" in model.huggingface_filename.lower():
+            mock_estimate = deepseek_r1_ud_iq2_xxs_full_offload()
+            if tensor_split:
+                mapping = {
+                    (
+                        25769803776,
+                        25769803776,
+                        25769803776,
+                        25769803776,
+                        25769803776,
+                        25769803776,
+                        25769803776,
+                        25769803776,
+                    ): deepseek_r1_ud_iq2_xxs_full_offload_split_8,
+                }
+                mock_estimate = mapping[tuple(tensor_split)]()
     if offload == GPUOffloadEnum.Partial:
         if "deepseek-r1-q4_k_m" in model.huggingface_filename.lower():
             mock_estimate = deepseek_r1_q4_k_m_partial_offload()  # TODO
@@ -1481,54 +1514,3 @@ def mock_calculate_model_resource_claim_for_deepseek_r1(  # noqa: C901
     return ModelInstanceResourceClaim(
         model_instance=model_instance, resource_claim_estimate=mock_estimate.estimate
     )
-
-
-def compare_candidates(  # noqa: C901
-    candidates: List[ModelInstanceScheduleCandidate], expected_candidates
-):
-    for i, expected in enumerate(expected_candidates):
-        candidate = candidates[i]
-        if "gpu_indexes" in expected:
-            assert candidate.gpu_indexes == expected["gpu_indexes"]
-
-        if "vram" in expected:
-            assert candidate.computed_resource_claim.vram == expected["vram"]
-
-        if "offload_layers" in expected:
-            assert (
-                candidate.computed_resource_claim.offload_layers
-                == expected["offload_layers"]
-            )
-
-        if "worker_id" in expected:
-            assert candidate.worker.id == expected["worker_id"]
-
-        if "worker_name" in expected:
-            assert candidate.worker.name == expected["worker_name"]
-
-        if "is_unified_memory" in expected:
-            assert (
-                candidate.computed_resource_claim.is_unified_memory
-                == expected["is_unified_memory"]
-            )
-
-        if "ram" in expected:
-            assert candidate.computed_resource_claim.ram == expected["ram"]
-
-        if "score" in expected:
-            assert str(candidate.score)[:5] == str(expected["score"])[:5]
-
-        if "rpc_servers" in expected:
-            for i, rpc_server in enumerate(expected["rpc_servers"]):
-                assert rpc_server.worker_id == expected["rpc_servers"][i].worker_id
-                assert rpc_server.gpu_index == expected["rpc_servers"][i].gpu_index
-                assert (
-                    rpc_server.computed_resource_claim
-                    == expected["rpc_servers"][i].computed_resource_claim
-                )
-
-        if "tensor_split" in expected:
-            assert (
-                candidate.computed_resource_claim.tensor_split
-                == expected["tensor_split"]
-            )

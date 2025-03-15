@@ -5,6 +5,8 @@ import fnmatch
 from huggingface_hub import HfFileSystem
 from huggingface_hub.utils import validate_repo_id
 from modelscope.hub.api import HubApi
+from transformers import PretrainedConfig
+from huggingface_hub import HfApi
 
 from gpustack.config.config import get_global_config
 from gpustack.schemas.models import Model, SourceEnum
@@ -80,6 +82,42 @@ def match_model_scope_file_paths(
     return matching_paths
 
 
+def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
+    """
+    Get the size of the model weights. This is the sum of all the weight files with extensions
+    .safetensors, .bin, .pt, .pth.
+    Args:
+        model: Model to get the weight size for
+        token: Optional Hugging Face API token
+    Returns:
+        int: The size of the model weights
+    """
+    if model.env and model.env['GPUSTACK_MODEL_WEIGHT_SIZE']:
+        # Use as a potential workaround if the model weight size is not expected.
+        return int(model.env['GPUSTACK_MODEL_WEIGHT_SIZE'])
+
+    weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
+    if model.source == SourceEnum.HUGGING_FACE:
+        api = HfApi(token=token)
+        repo_info = api.repo_info(model.huggingface_repo_id, files_metadata=True)
+        total_size = sum(
+            sibling.size
+            for sibling in repo_info.siblings
+            if sibling.size is not None
+            and sibling.rfilename.endswith(weight_file_extensions)
+        )
+        return total_size
+    elif model.source == SourceEnum.MODEL_SCOPE:
+        api = HubApi()
+        files = api.get_model_files(model.model_scope_model_id, recursive=True)
+
+        return sum(
+            file["Size"]
+            for file in files
+            if file["Name"].endswith(weight_file_extensions)
+        )
+
+
 def get_pretrained_config(model: Model, **kwargs):
     """
     Get the pretrained config of the model from Hugging Face or ModelScope.
@@ -126,7 +164,7 @@ def get_pretrained_config(model: Model, **kwargs):
 # Simplified from vllm.config._get_and_verify_max_len
 # Keep in our codebase to avoid dependency on vllm's internal
 # APIs which may change unexpectedly.
-# https://github.com/vllm-project/vllm/blob/v0.6.2/vllm/config.py#L1668
+# https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/config.py#L2453
 def get_max_model_len(pretrained_config) -> int:  # noqa: C901
     """Get the model's maximum length."""
     derived_max_model_len = float("inf")
@@ -141,6 +179,8 @@ def get_max_model_len(pretrained_config) -> int:  # noqa: C901
         "seq_length",
         # Command-R
         "model_max_length",
+        # Whisper
+        "max_target_positions",
         # Others
         "max_sequence_length",
         "max_seq_length",
@@ -188,3 +228,17 @@ def get_max_model_len(pretrained_config) -> int:  # noqa: C901
 
     logger.debug(f"Derived max model length: {derived_max_model_len}")
     return int(derived_max_model_len)
+
+
+# Similar to https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/transformers_utils/config.py#L700,
+# But we don't assert and fail if num_attention_heads is missing.
+def get_hf_text_config(config: PretrainedConfig):
+    """Get the "sub" config relevant to llm for multi modal models.
+    No op for pure text models.
+    """
+    if hasattr(config, "text_config") and hasattr(
+        config.text_config, "num_attention_heads"
+    ):
+        return config.text_config
+    else:
+        return config

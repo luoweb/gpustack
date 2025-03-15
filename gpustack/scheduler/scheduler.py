@@ -419,7 +419,9 @@ class Scheduler:
                 )
             else:
                 try:
-                    candidates_selector = VLLMResourceFitSelector(model, instance)
+                    candidates_selector = VLLMResourceFitSelector(
+                        self._config, model, instance
+                    )
                 except Exception as e:
                     return None, [f"VLLM resource fit selector init failed: {e}"]
 
@@ -431,11 +433,10 @@ class Scheduler:
             candidate = self.pick_highest_score_candidate(candidates)
 
             if candidate is None and len(workers) > 0:
-                resource_fit_message = (
-                    candidates_selector.get_message()
-                    or "No workers meet the resource requirements."
-                )
-                messages.append(resource_fit_message)
+                resource_fit_messages = candidates_selector.get_messages() or [
+                    "No workers meet the resource requirements."
+                ]
+                messages.extend(resource_fit_messages)
             return candidate, messages
         except Exception as e:
             state_message = (
@@ -500,7 +501,8 @@ class Scheduler:
                 )
                 model_instance.gpu_indexes = candidate.gpu_indexes
                 model_instance.distributed_servers = DistributedServers(
-                    rpc_servers=candidate.rpc_servers
+                    rpc_servers=candidate.rpc_servers,
+                    ray_actors=candidate.ray_actors,
                 )
 
                 await model_instance.update(session, model_instance)

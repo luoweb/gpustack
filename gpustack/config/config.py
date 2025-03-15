@@ -1,6 +1,6 @@
 import os
 import secrets
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from gpustack.utils import validators
@@ -18,6 +18,7 @@ from gpustack.schemas.workers import (
     VendorEnum,
     GPUDevicesInfo,
 )
+from gpustack.utils import platform
 from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
 
 _config = None
@@ -31,6 +32,8 @@ class Config(BaseSettings):
         data_dir: Directory to store data. Default is OS specific.
         token: Shared secret used to add a worker.
         huggingface_token: User Access Token to authenticate to the Hugging Face Hub.
+        enable_ray: Enable Ray.
+        ray_args: Additional arguments to pass to Ray.
 
         host: Host to bind the server to.
         port: Port to bind the server to.
@@ -47,6 +50,8 @@ class Config(BaseSettings):
         disable_update_check: Disable update check.
         update_check_url: URL to check for updates.
         model_catalog_file: Path or URL to the model catalog file.
+        ray_port: Port of Ray (GCS server). Used when Ray is enabled. Default is 40096.
+        ray_client_server_port: Port of Ray Client Server. Used when Ray is enabled. Default is 40097.
 
         server_url: URL of the server.
         worker_ip: IP address of the worker node. Auto-detected by default.
@@ -55,6 +60,11 @@ class Config(BaseSettings):
         disable_rpc_servers: Disable RPC servers.
         metrics_port: Port to expose metrics on.
         worker_port: Port to bind the worker to.
+        service_port_range: Port range for inference services, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '40000-40063'.
+        rpc_server_port_range: Port range for RPC servers, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '40064-40095'.
+        ray_node_manager_port: Raylet port for node manager. Used when Ray is enabled. Default is 40098.
+        ray_object_manager_port: Raylet port for object manager. Used when Ray is enabled. Default is 40099.
+        ray_worker_port_range: Port range for Ray worker processes, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '40100-40131'.
         log_dir: Directory to store logs.
         bin_dir: Directory to store additional binaries, e.g., versioned backend executables.
         pipx_path: Path to the pipx executable, used to install versioned backends.
@@ -68,6 +78,8 @@ class Config(BaseSettings):
     cache_dir: Optional[str] = None
     token: Optional[str] = None
     huggingface_token: Optional[str] = None
+    enable_ray: bool = False
+    ray_args: Optional[List[str]] = None
 
     # Server options
     host: Optional[str] = "0.0.0.0"
@@ -84,6 +96,8 @@ class Config(BaseSettings):
     disable_update_check: bool = False
     update_check_url: Optional[str] = None
     model_catalog_file: Optional[str] = None
+    ray_port: int = 40096
+    ray_client_server_port: int = 40097
 
     # Worker options
     server_url: Optional[str] = None
@@ -93,6 +107,11 @@ class Config(BaseSettings):
     disable_rpc_servers: bool = False
     worker_port: int = 10150
     metrics_port: int = 10151
+    service_port_range: Optional[str] = "40000-40063"
+    rpc_server_port_range: Optional[str] = "40064-40095"
+    ray_node_manager_port: int = 40098
+    ray_object_manager_port: int = 40099
+    ray_worker_port_range: Optional[str] = "40100-40131"
     log_dir: Optional[str] = None
     resources: Optional[dict] = None
     bin_dir: Optional[str] = None
@@ -129,7 +148,11 @@ class Config(BaseSettings):
             self.system_reserved = {"ram": 2, "vram": 1}
 
     @model_validator(mode="after")
-    def check_all(self):
+    def check_all(self):  # noqa: C901
+        if 'PYTEST_CURRENT_TEST' in os.environ:
+            # Skip validation during tests
+            return self
+
         if (self.ssl_keyfile and not self.ssl_certfile) or (
             self.ssl_certfile and not self.ssl_keyfile
         ):
@@ -151,7 +174,47 @@ class Config(BaseSettings):
             self.get_gpu_devices()
             self.get_system_info()
 
+        if self.enable_ray:
+            self.check_ray()
+
+        if self.service_port_range:
+            self.check_port_range(self.service_port_range)
+
+        if self.rpc_server_port_range:
+            self.check_port_range(self.rpc_server_port_range)
+
+        if self.ray_worker_port_range:
+            self.check_port_range(self.ray_worker_port_range)
+
         return self
+
+    def check_ray(self):
+        system = platform.system()
+        if system != "linux":
+            raise Exception("Ray is only supported on Linux.")
+
+        if not TYPE_CHECKING:
+            try:
+                from vllm.platforms import current_platform
+            except ImportError:
+                raise Exception(
+                    "vLLM is not installed. Please install vLLM to work with Ray."
+                )
+
+            device_str = current_platform.ray_device_key
+            if not device_str:
+                raise Exception(
+                    f"current platform {current_platform.device_name} does not support Ray."
+                )
+
+    def check_port_range(self, port_range: str):
+        ports = port_range.split("-")
+        if len(ports) != 2:
+            raise Exception(f"Invalid port range: {port_range}")
+        if not ports[0].isdigit() or not ports[1].isdigit():
+            raise Exception("Port range must be numeric")
+        if int(ports[0]) > int(ports[1]):
+            raise Exception(f"Invalid port range: {ports[0]} > {ports[1]}")
 
     def get_system_info(self) -> SystemInfo:  # noqa: C901
         """get system info from resources
