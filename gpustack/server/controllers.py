@@ -123,9 +123,13 @@ async def set_default_worker_selector(session: AsyncSession, model: Model):
         return
 
     model = await Model.one_by_id(session, model.id)
-    if not model.worker_selector and get_backend(model) == BackendEnum.VLLM:
-        # vLLM models are only supported on Linux amd64
-        model.worker_selector = {"os": "linux", "arch": "amd64"}
+    if (
+        not model.worker_selector
+        and not model.gpu_selector
+        and get_backend(model) == BackendEnum.VLLM
+    ):
+        # vLLM models are only supported on Linux
+        model.worker_selector = {"os": "linux"}
         await model.update(session)
 
 
@@ -503,6 +507,10 @@ class ModelFileController:
         try:
             async with AsyncSession(self._engine) as session:
                 file = await ModelFile.one_by_id(session, file.id)
+
+                if not file:
+                    # In case the file is deleted
+                    return
 
                 for instance in file.instances:
                     await sync_instance_files_state(session, instance, [file])
