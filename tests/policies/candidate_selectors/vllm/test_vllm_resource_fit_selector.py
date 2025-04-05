@@ -2,14 +2,15 @@ import shutil
 import tempfile
 import pytest
 from unittest.mock import patch, AsyncMock
-from tests.utils.model import new_model, new_model_instance
+from tests.utils.model import new_model
 from gpustack.config.config import Config, set_global_config
 from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
     VLLMResourceFitSelector,
 )
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
-from gpustack.scheduler.scheduler import Scheduler
+from gpustack.scheduler import scheduler
 from gpustack.schemas.models import (
+    CategoryEnum,
     ComputedResourceClaim,
     GPUSelector,
     RayActor,
@@ -67,15 +68,17 @@ async def test_manual_schedule_to_2_worker_2_gpu(config):
         ),
         backend_parameters=[],
     )
-    mi = new_model_instance(1, "test_name", 1)
 
-    resource_fit_selector = VLLMResourceFitSelector(config, m, mi)
-    placement_scorer = PlacementScorer(m, mi)
-    scheduler = Scheduler(config)
+    resource_fit_selector = VLLMResourceFitSelector(config, m)
+    placement_scorer = PlacementScorer(m)
 
     with (
         patch(
             'gpustack.policies.utils.get_worker_model_instances',
+            return_value=[],
+        ),
+        patch(
+            'gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_worker_model_instances',
             return_value=[],
         ),
         patch(
@@ -91,7 +94,7 @@ async def test_manual_schedule_to_2_worker_2_gpu(config):
 
         candidates = await resource_fit_selector.select_candidates(workers)
         candidates = await placement_scorer.score(candidates)
-        candidate, _ = await scheduler.find_candidate(mi, m, workers)
+        candidate, _ = await scheduler.find_candidate(config, m, workers)
 
         expected_candidates = [
             {
@@ -144,15 +147,17 @@ async def test_manual_schedule_to_2_worker_4_gpu_select_main_with_most_gpus(
         ),
         backend_parameters=[],
     )
-    mi = new_model_instance(1, "test_name", 1)
 
-    resource_fit_selector = VLLMResourceFitSelector(config, m, mi)
-    placement_scorer = PlacementScorer(m, mi)
-    scheduler = Scheduler(config)
+    resource_fit_selector = VLLMResourceFitSelector(config, m)
+    placement_scorer = PlacementScorer(m)
 
     with (
         patch(
             'gpustack.policies.utils.get_worker_model_instances',
+            return_value=[],
+        ),
+        patch(
+            'gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_worker_model_instances',
             return_value=[],
         ),
         patch(
@@ -168,7 +173,7 @@ async def test_manual_schedule_to_2_worker_4_gpu_select_main_with_most_gpus(
 
         candidates = await resource_fit_selector.select_candidates(workers)
         candidates = await placement_scorer.score(candidates)
-        candidate, _ = await scheduler.find_candidate(mi, m, workers)
+        candidate, _ = await scheduler.find_candidate(config, m, workers)
 
         expected_candidates = [
             {
@@ -225,15 +230,17 @@ async def test_manual_schedule_to_3_workers_4_gpus(
         ),
         backend_parameters=[],
     )
-    mi = new_model_instance(1, "test_name", 1)
 
-    resource_fit_selector = VLLMResourceFitSelector(config, m, mi)
-    placement_scorer = PlacementScorer(m, mi)
-    scheduler = Scheduler(config)
+    resource_fit_selector = VLLMResourceFitSelector(config, m)
+    placement_scorer = PlacementScorer(m)
 
     with (
         patch(
             'gpustack.policies.utils.get_worker_model_instances',
+            return_value=[],
+        ),
+        patch(
+            'gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_worker_model_instances',
             return_value=[],
         ),
         patch(
@@ -249,7 +256,7 @@ async def test_manual_schedule_to_3_workers_4_gpus(
 
         candidates = await resource_fit_selector.select_candidates(workers())
         candidates = await placement_scorer.score(candidates)
-        candidate, _ = await scheduler.find_candidate(mi, m, workers())
+        candidate, _ = await scheduler.find_candidate(config, m, workers())
 
         expected_candidates = [
             {
@@ -300,11 +307,9 @@ async def test_auto_schedule_to_2_worker_2_gpu(config):
         cpu_offloading=False,
         backend_parameters=[],
     )
-    mi = new_model_instance(1, "test_name", 1)
 
-    resource_fit_selector = VLLMResourceFitSelector(config, m, mi)
-    placement_scorer = PlacementScorer(m, mi)
-    scheduler = Scheduler(config)
+    resource_fit_selector = VLLMResourceFitSelector(config, m)
+    placement_scorer = PlacementScorer(m)
 
     with (
         patch(
@@ -324,7 +329,7 @@ async def test_auto_schedule_to_2_worker_2_gpu(config):
 
         candidates = await resource_fit_selector.select_candidates(workers)
         candidates = await placement_scorer.score(candidates)
-        candidate, _ = await scheduler.find_candidate(mi, m, workers)
+        candidate, _ = await scheduler.find_candidate(config, m, workers)
 
         expected_candidates = [
             {
@@ -371,11 +376,9 @@ async def test_auto_schedule_to_2_worker_16_gpu_deepseek_r1(config):
         cpu_offloading=False,
         backend_parameters=[],
     )
-    mi = new_model_instance(1, "test_name", 1)
 
-    resource_fit_selector = VLLMResourceFitSelector(config, m, mi)
-    placement_scorer = PlacementScorer(m, mi)
-    scheduler = Scheduler(config)
+    resource_fit_selector = VLLMResourceFitSelector(config, m)
+    placement_scorer = PlacementScorer(m)
 
     with (
         patch(
@@ -395,7 +398,7 @@ async def test_auto_schedule_to_2_worker_16_gpu_deepseek_r1(config):
 
         candidates = await resource_fit_selector.select_candidates(workers)
         candidates = await placement_scorer.score(candidates)
-        candidate, _ = await scheduler.find_candidate(mi, m, workers)
+        candidate, _ = await scheduler.find_candidate(config, m, workers)
 
         expected_candidates = [
             {
@@ -431,6 +434,62 @@ async def test_auto_schedule_to_2_worker_16_gpu_deepseek_r1(config):
                         ),
                     ),
                 ],
+            },
+        ]
+
+        assert len(candidates) == 1
+        assert candidate == candidates[0]
+        compare_candidates(candidates, expected_candidates)
+
+
+@pytest.mark.asyncio
+async def test_auto_schedule_embedding_models(config):
+    workers = [
+        linux_nvidia_1_4090_24gx1(),
+    ]
+
+    m = new_model(
+        1,
+        "test_name",
+        1,
+        huggingface_repo_id="BAAI/bge-base-en-v1.5",
+        cpu_offloading=False,
+        backend_parameters=[],
+        categories=[CategoryEnum.EMBEDDING],
+    )
+
+    resource_fit_selector = VLLMResourceFitSelector(config, m)
+    placement_scorer = PlacementScorer(m)
+
+    with (
+        patch(
+            'gpustack.policies.utils.get_worker_model_instances',
+            return_value=[],
+        ),
+        patch(
+            'gpustack.policies.scorers.placement_scorer.get_model_instances',
+            return_value=[],
+        ),
+        patch('sqlmodel.ext.asyncio.session.AsyncSession', AsyncMock()),
+        patch(
+            'gpustack.schemas.workers.Worker.all',
+            return_value=workers,
+        ),
+    ):
+
+        candidates = await resource_fit_selector.select_candidates(workers)
+        candidates = await placement_scorer.score(candidates)
+        candidate, _ = await scheduler.find_candidate(config, m, workers)
+
+        expected_candidates = [
+            {
+                "worker_id": 2,
+                "worker_name": "host4090",
+                "gpu_indexes": [0],
+                "is_unified_memory": False,
+                "vram": {
+                    0: 1588014354,
+                },
             },
         ]
 

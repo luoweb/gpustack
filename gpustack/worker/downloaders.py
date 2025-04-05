@@ -4,9 +4,9 @@ import time
 import logging
 import os
 import re
-from filelock import FileLock
+from filelock import SoftFileLock
 import requests
-from typing import List, Literal, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 from pathlib import Path
 from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
@@ -145,7 +145,6 @@ class HfDownloader:
         extra_filename: Optional[str],
         token: Optional[str] = None,
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
-        local_dir_use_symlinks: Union[bool, Literal["auto"]] = "auto",
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         max_workers: int = 8,
     ) -> List[str]:
@@ -170,26 +169,30 @@ class HfDownloader:
             The paths to the downloaded model files.
         """
 
-        if filename:
-            return cls.download_file(
-                repo_id=repo_id,
-                filename=filename,
-                token=token,
-                local_dir=local_dir,
-                local_dir_use_symlinks=local_dir_use_symlinks,
-                cache_dir=cache_dir,
-                extra_filename=extra_filename,
-            )
+        group_or_owner, name = model_id_to_group_owner_name(repo_id)
+        lock_filename = os.path.join(cache_dir, group_or_owner, f"{name}.lock")
 
-        return [
-            snapshot_download(
-                repo_id=repo_id,
-                token=token,
-                local_dir=local_dir,
-                local_dir_use_symlinks=local_dir_use_symlinks,
-                cache_dir=cache_dir,
-            )
-        ]
+        if local_dir is None:
+            local_dir = os.path.join(cache_dir, group_or_owner, name)
+
+        logger.info(f"Retriving file lock: {lock_filename}")
+        with SoftFileLock(lock_filename):
+            if filename:
+                return cls.download_file(
+                    repo_id=repo_id,
+                    filename=filename,
+                    token=token,
+                    local_dir=local_dir,
+                    extra_filename=extra_filename,
+                )
+
+            return [
+                snapshot_download(
+                    repo_id=repo_id,
+                    token=token,
+                    local_dir=local_dir,
+                )
+            ]
 
     @classmethod
     def download_file(
@@ -198,8 +201,6 @@ class HfDownloader:
         filename: Optional[str],
         token: Optional[str] = None,
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
-        local_dir_use_symlinks: Union[bool, Literal["auto"]] = "auto",
-        cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         max_workers: int = 8,
         extra_filename: Optional[str] = None,
     ) -> List[str]:
@@ -239,8 +240,6 @@ class HfDownloader:
                 token=token,
                 subfolder=subfolder,
                 local_dir=local_dir,
-                local_dir_use_symlinks=local_dir_use_symlinks,
-                cache_dir=cache_dir,
             )
             downloaded_files.append(downloaded_file)
 
@@ -354,8 +353,8 @@ class OllamaLibraryDownloader:
         model_path = os.path.join(model_dir, sanitized_filename)
         lock_filename = model_path + ".lock"
 
-        logger.info("Retriving file lock")
-        with FileLock(lock_filename):
+        logger.info(f"Retriving file lock: {lock_filename}")
+        with SoftFileLock(lock_filename):
             if os.path.exists(model_path):
                 return [model_path]
 
@@ -622,11 +621,10 @@ class ModelScopeDownloader:
         """
 
         group_or_owner, name = model_id_to_group_owner_name(model_id)
-        name = name.replace('.', '___')
         lock_filename = os.path.join(cache_dir, group_or_owner, f"{name}.lock")
 
         logger.info("Retriving file lock")
-        with FileLock(lock_filename):
+        with SoftFileLock(lock_filename):
             if file_path:
                 matching_files = match_model_scope_file_paths(
                     model_id, file_path, extra_file_path
