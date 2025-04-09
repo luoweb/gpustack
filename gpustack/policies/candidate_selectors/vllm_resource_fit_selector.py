@@ -51,7 +51,7 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
     - 72B requires 164.5 GiB
 
     """
-    if model.env and model.env['GPUSTACK_MODEL_VRAM_CLAIM']:
+    if model.env and 'GPUSTACK_MODEL_VRAM_CLAIM' in model.env:
         # Use as a potential workaround if the empirical vram estimation is far beyond the expected value.
         return int(model.env['GPUSTACK_MODEL_VRAM_CLAIM'])
 
@@ -469,7 +469,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                 gpu_list.append(gpu)
 
         if total_allocatable_vram > self._largest_multi_gpu_total:
-            self._largest_multi_gpu_total = total_allocatable_vram
+            self._largest_multi_gpu_vram = total_allocatable_vram
             self._largest_multi_gpu_utilization_satisfied_count = satisfied_gpu_count
             self._largest_multi_gpu_total = len(worker.status.gpu_devices)
 
@@ -560,7 +560,10 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         if self._selected_gpu_workers:
             return await self.manual_select_multi_worker_multi_gpu_candidates(workers)
 
-        return await self.auto_select_multi_worker_multi_gpu_candidates(workers)
+        if self._model.distributed_inference_across_workers:
+            return await self.auto_select_multi_worker_multi_gpu_candidates(workers)
+
+        return []
 
     async def auto_select_multi_worker_multi_gpu_candidates(
         self, workers: List[Worker]

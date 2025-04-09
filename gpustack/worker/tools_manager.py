@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 import shutil
 import stat
@@ -9,16 +10,18 @@ import time
 from typing import Optional
 import zipfile
 import requests
+
 from gpustack.schemas.models import BackendEnum
 from gpustack.utils.command import get_versioned_command
 from gpustack.utils.compat_importlib import pkg_resources
-from gpustack.utils import platform
+from gpustack.utils import platform, envs
 
 logger = logging.getLogger(__name__)
 
 
 BUILTIN_LLAMA_BOX_VERSION = "v0.0.129"
 BUILTIN_GGUF_PARSER_VERSION = "v0.13.20"
+BUILTIN_RAY_VERSION = "2.43.0"
 
 
 class ToolsManager:
@@ -152,6 +155,8 @@ class ToolsManager:
             self.install_versioned_vllm(version)
         elif backend == BackendEnum.VOX_BOX:
             self.install_versioned_package_by_pipx("vox-box", version)
+        elif backend == BackendEnum.ASCEND_MINDIE:
+            self.install_versioned_ascend_mindie(version)
         else:
             raise NotImplementedError(
                 f"Auto-installation for versioned {backend} is not supported. Please install it manually."
@@ -174,6 +179,48 @@ class ToolsManager:
 
         # Update versions.json
         self._update_versions_file(file_name, version)
+
+    def install_versioned_ascend_mindie(self, version: str):
+        if self._os != "linux":
+            raise Exception("Only Linux is supported")
+
+        version = version if not version.startswith("v") else version[1:]
+        target_dir = next(
+            (
+                rp
+                for rp in envs.get_unix_available_root_paths_of_ascend()
+                if rp.joinpath("mindie", version).is_dir()
+            ),
+            None,
+        )
+
+        # NB(thxCode): Only check mindie-service here,
+        # but MindIE must work with mindie-service, mindie-rt, mindie-torch and mindie-llm.
+        # We assume that the mindie-service is installed by ascend run package,
+        # so that we check whether the set_env.sh exists to determine the installation.
+        target_file = target_dir.joinpath(
+            "mindie", version, "mindie-service", "set_env.sh"
+        )
+        if target_file.exists():
+            if target_file.is_file():
+                logger.debug(
+                    f"Ascend MindIE {version} already exists, skipping download"
+                )
+                return
+            else:
+                raise Exception(
+                    f"Ascend MindIE {version} already exists, but not a file"
+                )
+
+        target_dir = next(
+            (
+                rp
+                for rp in envs.get_unix_available_root_paths_of_ascend(writable=True)
+                if rp.joinpath("mindie", version).is_dir()
+            ),
+            None,
+        )
+        self._download_acsend_mindie(version, target_dir)
 
     def install_versioned_llama_box(self, version: str):
         target_dir = Path(self._bin_dir)
@@ -203,9 +250,18 @@ class ToolsManager:
                 f"Auto-installation for versioned vLLM is only supported on CUDA devices. Please install vLLM manually and link it to {target_path}."
             )
 
-        self.install_versioned_package_by_pipx("vllm", version)
+        self.install_versioned_package_by_pipx(
+            "vllm",
+            version,
+            extra_packages=[
+                "gpustack",  # To apply Ray patch for dist vLLM
+                f"ray=={BUILTIN_RAY_VERSION}",  # To avoid version conflict with Ray cluster
+            ],
+        )
 
-    def install_versioned_package_by_pipx(self, package: str, version: str):
+    def install_versioned_package_by_pipx(
+        self, package: str, version: str, extra_packages: Optional[list] = None
+    ):
         """
         Install a versioned package using pipx.
 
@@ -247,7 +303,7 @@ class ToolsManager:
 
         try:
             logger.info(f"Installing {package} {version} using pipx")
-            subprocess.run(install_command, check=True, text=True)
+            subprocess.run(install_command, capture_output=True, check=True, text=True)
 
             installed_bin_path = pipx_bin_path / f"{package}{suffix}"
             if not installed_bin_path.exists():
@@ -259,15 +315,34 @@ class ToolsManager:
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.symlink_to(installed_bin_path)
 
-            print(
+            if extra_packages:
+                for extra_package in extra_packages:
+                    self._pipx_inject_package(
+                        pipx_path, f"{package}{suffix}", extra_package
+                    )
+
+            logger.info(
                 f"{package} {version} successfully installed and linked to {target_path}"
             )
-        except subprocess.CalledProcessError as e:
-            raise Exception(
-                f"Failed to install {package} {version} using pipx: {e}"
-            ) from e
         except Exception as e:
-            raise Exception(f"An error occurred: {e}") from e
+            raise Exception(f"Failed to install {package} {version} using pipx: {e}")
+
+    def _pipx_inject_package(self, pipx_path: str, env_name: str, package: str):
+        """
+        Use `pipx inject` to add a package to an existing pipx environment.
+        """
+        try:
+            logger.info(f"Injecting {package} into pipx environment '{env_name}'")
+            subprocess.run(
+                [pipx_path, "inject", env_name, package, "--force"],
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to inject {package} into pipx environment '{env_name}': {e}"
+            )
 
     def _get_pipx_bin_dir(self, pipx_path: str) -> Path:
         """
@@ -287,6 +362,41 @@ class ToolsManager:
             raise Exception(
                 f"Failed to execute 'pipx environment --value PIPX_BIN_DIR': {e}"
             )
+
+    def _download_acsend_mindie(self, version: str, target_dir: Path):
+        # Check if the system is supported
+        if self._os != "linux" or self._arch not in ["amd64", "arm64"]:
+            raise Exception(
+                "Auto-installation for Ascend MindIE is only supported on Linux amd64/arm64. Please install MindIE manually."
+            )
+
+        target_file_arch = "x86_64" if self._arch == "amd64" else "aarch64"
+        target_file_name = f"Ascend-mindie_{version}_linux-{target_file_arch}.run"
+
+        # Construct download url, for example:
+        # - https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/MindIE/MindIE%201.0.0/Ascend-mindie_1.0.0_linux-x86_64.run?response-content-type=application/octet-stream
+        # - https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/MindIE/MindIE%201.0.0/Ascend-mindie_1.0.0_linux-aarch64.run?response-content-type=application/octet-stream
+        base_url = "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com"
+        url_path = f"/MindIE/MindIE%20{version}/{target_file_name}?response-content-type=application/octet-stream"
+
+        # Create system temporary directory for downloading and installing
+        fd, tmp_dir = tempfile.mkstemp(prefix="acsend_mindie")
+
+        # Download and install the MindIE package
+        try:
+            with os.fdopen(fd, "w"):
+                target_file = os.path.join(tmp_dir, target_file_name)
+
+                logger.info(
+                    f"Downloading Ascend MindIE '{version}' from '{base_url}/{url_path}'"
+                )
+                self._download_file(url_path, target_file, base_url)
+
+                logger.info(f"Installing Ascend MindIE '{version}'")
+                target_dir.mkdir(parents=True, exist_ok=True)
+                self._install_run_pkg(target_file, str(target_dir))
+        finally:
+            os.remove(tmp_dir)
 
     def _download_llama_box(
         self, version: str, target_dir: Path, target_file_name: str
@@ -358,18 +468,18 @@ class ToolsManager:
             and self._device == platform.DeviceTypeEnum.MUSA.value
         ):
             platform_name = "linux-amd64-musa-rc3.1"
-        elif (
-            self._os == "linux"
-            and self._arch == "amd64"
-            and self._device == platform.DeviceTypeEnum.NPU.value
-        ):
-            platform_name = "linux-amd64-cann-8.0"
-        elif (
-            self._os == "linux"
-            and self._arch == "arm64"
-            and self._device == platform.DeviceTypeEnum.NPU.value
-        ):
-            platform_name = "linux-arm64-cann-8.0"
+        elif self._os == "linux" and self._device == platform.DeviceTypeEnum.NPU.value:
+            # Available version: 8.0.0(.beta1) [default] / 8.0.rc2(.beta1) / 8.0.rc3(.beta1)
+            version = "8.0"
+            if ".rc2" in os.getenv("CANN_VERSION", ""):
+                version = "8.0.rc2"
+            elif ".rc3" in os.getenv("CANN_VERSION", ""):
+                version = "8.0.rc3"
+            # Available variant: 910b [default] / 310p
+            variant = ""
+            if os.getenv("CANN_CHIP", "") == "310p":
+                variant = "-310p"
+            platform_name = f"linux-{self._arch}-cann-{version}{variant}"
         elif (
             self._os == "linux"
             and self._arch == "amd64"
@@ -540,12 +650,14 @@ class ToolsManager:
 
         return platform_name
 
-    def _download_file(self, url_path: str, target_path: str):
+    def _download_file(self, url_path: str, target_path: str, base_url: str = None):
         """Download a file from the URL to the target path."""
         if not self._download_base_url:
             self._check_and_set_download_base_url()
 
         url = f"{self._download_base_url}/{url_path}"
+        if base_url:
+            url = f"{base_url}/{url_path}"
         max_retries = 5
         retries = 0
         while retries < max_retries:
@@ -575,3 +687,17 @@ class ToolsManager:
             raise Exception(f"error extracting {file_path}: {e}")
         except Exception as e:
             raise Exception(f"error extracting {file_path}: {e}")
+
+    def _install_run_pkg(self, run_package_path: str, target_dir: str):
+        """Install a run package to the target directory."""
+        args = [
+            run_package_path,
+            "--install",
+            f"--install-path={target_dir}",
+            "--quiet",
+        ]
+        try:
+            os.chmod(run_package_path, 0o755)
+            subprocess.run(args, check=True)
+        except subprocess.CalledProcessError as e:
+            raise Exception(f"Error running {run_package_path} {' '.join(args)}: {e}")

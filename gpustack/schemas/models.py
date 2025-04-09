@@ -46,6 +46,7 @@ class BackendEnum(str, Enum):
     LLAMA_BOX = "llama-box"
     VLLM = "vllm"
     VOX_BOX = "vox-box"
+    ASCEND_MINDIE = "ascend-mindie"
 
 
 class GPUSelector(BaseModel):
@@ -133,7 +134,7 @@ class ModelSource(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
 
-class ModelBase(SQLModel, ModelSource):
+class ModelSpecBase(SQLModel, ModelSource):
     name: str = Field(index=True, unique=True)
     description: Optional[str] = None
     meta: Optional[Dict[str, Any]] = Field(sa_column=Column(JSON), default={})
@@ -162,8 +163,8 @@ class ModelBase(SQLModel, ModelSource):
         PydanticField(default=False, deprecated="Deprecated, use categories instead"),
     ]
     placement_strategy: PlacementStrategyEnum = PlacementStrategyEnum.SPREAD
-    cpu_offloading: bool = False
-    distributed_inference_across_workers: bool = False
+    cpu_offloading: Optional[bool] = None
+    distributed_inference_across_workers: Optional[bool] = None
     worker_selector: Optional[Dict[str, str]] = Field(
         sa_column=Column(JSON), default={}
     )
@@ -180,6 +181,20 @@ class ModelBase(SQLModel, ModelSource):
     distributable: Optional[bool] = False
 
     @model_validator(mode="after")
+    def set_defaults(self):
+        backend = get_backend(self)
+        if self.cpu_offloading is None:
+            self.cpu_offloading = True if backend == BackendEnum.LLAMA_BOX else False
+
+        if self.distributed_inference_across_workers is None:
+            self.distributed_inference_across_workers = (
+                True if backend in [BackendEnum.LLAMA_BOX, BackendEnum.VLLM] else False
+            )
+        return self
+
+
+class ModelBase(ModelSpecBase):
+    @model_validator(mode="after")
     def validate(self):
         backend = get_backend(self)
         if backend == BackendEnum.LLAMA_BOX:
@@ -190,14 +205,15 @@ class ModelBase(SQLModel, ModelSource):
         elif backend == BackendEnum.VLLM:
             if self.cpu_offloading:
                 raise ValueError("CPU offloading is only supported for GGUF models")
-            if self.distributed_inference_across_workers:
-                raise ValueError(
-                    "Distributed inference accross workers is only supported for GGUF models"
-                )
         elif backend == BackendEnum.VOX_BOX:
             if self.distributed_inference_across_workers:
                 raise ValueError(
-                    "Distributed inference accross workers is only supported for GGUF models"
+                    "Distributed inference accross workers is not supported for the vox-box backend"
+                )
+        elif backend == BackendEnum.ASCEND_MINDIE:
+            if self.distributed_inference_across_workers:
+                raise ValueError(
+                    "Distributed inference accross workers is not supported for the ascend-mindie backend"
                 )
         return self
 
