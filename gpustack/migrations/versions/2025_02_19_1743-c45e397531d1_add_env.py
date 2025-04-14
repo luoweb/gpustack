@@ -5,6 +5,7 @@ Revises: e6bf9e067296
 Create Date: 2025-02-19 17:43:06.434145
 
 """
+import shutil
 from typing import Sequence, Union
 import glob
 import logging
@@ -20,7 +21,10 @@ from gpustack.migrations.utils import column_exists, table_exists
 
 logger = logging.getLogger(__name__)
 
-
+naming_convention = {
+    "fk":
+    "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+}
 
 # revision identifiers, used by Alembic.
 revision: str = 'c45e397531d1'
@@ -75,8 +79,11 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('model_instance_id', 'model_file_id')
         )
 
-    create_legacy_hf_cache_symlinks()
+    migrate_legacy_hf_cache()
     remove_legacy_ms_cache_locks()
+    alter_users_table_autoincrement_keyword(True)
+    delete_orphan_keys()
+    alter_api_keys_foreign_key(True)
 
 
 def downgrade() -> None:
@@ -96,8 +103,10 @@ def downgrade() -> None:
 
     if table_exists('model_files'):
         op.drop_table('model_files')
+    alter_users_table_autoincrement_keyword(False)
+    alter_api_keys_foreign_key(False)
 
-def create_legacy_hf_cache_symlinks():
+def migrate_legacy_hf_cache():
     config = get_global_config()
     hf_cache_base = os.path.join(config.cache_dir, "huggingface")
     model_dirs = glob.glob(os.path.join(hf_cache_base, "models--*--*"))
@@ -120,13 +129,29 @@ def create_legacy_hf_cache_symlinks():
         first_snapshot = os.path.join(snapshot_dir, snapshot_subdirs[0])
         target_path = os.path.join(hf_cache_base, org, model)
 
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
-        if os.path.exists(target_path) or os.path.islink(target_path):
+        if os.path.exists(target_path):
+            logger.info(f"Target path already exists, skipping: {target_path}")
             continue
 
-        os.symlink(first_snapshot, target_path)
-        logger.info(f"Created symlink: {target_path} -> {first_snapshot}")
+        os.makedirs(target_path, exist_ok=True)
+
+        for filename in os.listdir(first_snapshot):
+            src_path = os.path.join(first_snapshot, filename)
+            dst_path = os.path.join(target_path, filename)
+
+            try:
+                if os.path.islink(src_path):
+                    real_path = os.path.realpath(src_path)
+                    shutil.copy2(real_path, dst_path)
+                else:
+                    shutil.copy2(src_path, dst_path)
+            except Exception as e:
+                logger.warning(f"Failed to copy {src_path} to {dst_path}: {e}")
+
+        shutil.rmtree(model_dir, ignore_errors=True)
+        logger.info(f"Migrated from {first_snapshot} to {target_path}")
+
 
 def remove_legacy_ms_cache_locks():
     config = get_global_config()
@@ -149,3 +174,34 @@ def remove_legacy_ms_cache_locks():
                         logger.info(f"Deleted lock file: {lock_path}")
                     except Exception as e:
                         logger.warning(f"Failed to delete lock file {lock_path}: {e}")
+
+def alter_users_table_autoincrement_keyword(auto_increment=False) -> None:
+    conn = op.get_bind()
+    if conn.engine.name != 'sqlite':
+        return
+    kwarg = dict()
+    if auto_increment:
+        kwarg['sqlite_autoincrement'] = True
+    # Refer to the workaround here https://github.com/sqlalchemy/alembic/issues/380
+    # batchop can only use table_kwargs to parse sqlite_autoincrement to create AUTOINCREMENT keywork for the primary key
+    with op.batch_alter_table('users', table_kwargs=kwarg, recreate='always') as batch_op:
+        pass
+
+def alter_api_keys_foreign_key(foreign_key=False) -> None:
+    foreign_key_name = 'fk_api_keys_user_id_users'
+    with op.batch_alter_table('api_keys', naming_convention=naming_convention) as batch_op:
+        if foreign_key:
+            batch_op.create_foreign_key(foreign_key_name, 'users', ['user_id'], ['id'], ondelete='CASCADE')
+        else:
+            batch_op.drop_constraint(foreign_key_name, type_='foreignkey')
+
+def delete_orphan_keys() -> None:
+    conn = op.get_bind()
+    conn.execute(
+        sa.text(
+            """
+            DELETE FROM api_keys
+            WHERE user_id NOT IN (SELECT id FROM users)
+            """
+        )
+    )

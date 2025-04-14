@@ -8,7 +8,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from cachetools import TTLCache
 
 from gpustack.api.exceptions import HTTPException
-from gpustack.config.config import Config
+from gpustack.config.config import Config, VendorEnum
 from gpustack.policies.base import ModelInstanceScheduleCandidate, Worker
 from gpustack.routes.models import validate_model_in
 from gpustack.scheduler import scheduler
@@ -21,6 +21,7 @@ from gpustack.schemas.model_evaluations import (
 
 from gpustack.schemas.models import (
     BackendEnum,
+    CategoryEnum,
     SourceEnum,
     get_backend,
     is_audio_model,
@@ -132,8 +133,8 @@ async def evaluate_model(
 
     evaluations = [
         (evaluate_model_input, (session, model)),
-        (evaluate_environment, (model, workers)),
         (evaluate_model_metadata, (config, model)),
+        (evaluate_environment, (model, workers)),
     ]
     for evaluation, args in evaluations:
         compatible, messages = await evaluation(*args)
@@ -149,6 +150,12 @@ async def evaluate_model(
         result.compatible = False
         result.compatibility_messages.append(
             "Unable to find a schedulable worker for the model."
+        )
+        result.scheduling_messages = schedule_messages
+    elif candidate.overcommit:
+        result.compatible = False
+        result.compatibility_messages.append(
+            "Selected GPUs may not have enough resources to run the model."
         )
         result.scheduling_messages = schedule_messages
     else:
@@ -218,13 +225,37 @@ async def evaluate_environment(
     model: ModelSpec,
     workers: List[Worker],
 ) -> Tuple[bool, List[str]]:
-    has_linux_workers = any(worker.labels["os"] == "linux" for worker in workers)
+    has_linux_workers = any(worker.labels.get("os") == "linux" for worker in workers)
     if get_backend(model) == BackendEnum.VLLM and not has_linux_workers:
         return False, [
             "The model requires Linux workers but none are available. Use GGUF models instead."
         ]
 
+    only_windows_workers = all(
+        worker.labels.get("os") == "windows" for worker in workers
+    )
+    if (
+        only_windows_workers
+        and model.backend == BackendEnum.VOX_BOX
+        and CategoryEnum.TEXT_TO_SPEECH.value in model.categories
+    ):
+        return False, ["The model is not supported on Windows workers."]
+
+    if model.backend == BackendEnum.ASCEND_MINDIE and not has_ascend_npu(workers):
+        return False, [
+            "The MindIE backend requires Ascend NPUs but none are available."
+        ]
+
     return True, []
+
+
+def has_ascend_npu(workers: List[Worker]) -> bool:
+    for worker in workers:
+        if worker.status and worker.status.gpu_devices:
+            for gpu in worker.status.gpu_devices:
+                if gpu.vendor == VendorEnum.Huawei.value:
+                    return True
+    return False
 
 
 async def evaluate_model_metadata(

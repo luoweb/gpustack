@@ -93,7 +93,11 @@ def get_model_file_size(
             cache_dir=os.path.join(cache_dir, "ollama"),
         )
     elif model.source == SourceEnum.LOCAL_PATH:
-        return file.getsize(model.local_path)
+        sharded_or_original_file_paths = file.get_sharded_file_paths(model.local_path)
+        total_size = 0
+        for file_path in sharded_or_original_file_paths:
+            total_size += file.getsize(file_path)
+        return total_size
 
     raise ValueError(f"Unsupported model source: {model.source}")
 
@@ -622,7 +626,7 @@ class ModelScopeDownloader:
         group_or_owner, name = model_id_to_group_owner_name(model_id)
         lock_filename = os.path.join(cache_dir, group_or_owner, f"{name}.lock")
 
-        logger.info("Retriving file lock")
+        logger.info(f"Retriving file lock: {lock_filename}")
         with SoftFileLock(lock_filename):
             if file_path:
                 matching_files = match_model_scope_file_paths(
