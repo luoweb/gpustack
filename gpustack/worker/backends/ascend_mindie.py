@@ -266,7 +266,7 @@ class AscendMindIEParameters:
 
 
 class AscendMindIEServer(InferenceServer):
-    def start(self):
+    def start(self):  # noqa: max-complexity=15
 
         version = self._model.backend_version
         if not version:
@@ -316,8 +316,6 @@ class AscendMindIEServer(InferenceServer):
         # - Global config
         # -- Pin installation path, which helps to locate other resources.
         env["MIES_INSTALL_PATH"] = str(install_path)
-        # -- Disable exposing metrics.
-        env["MIES_SERVICE_MONITOR_MODE"] = "0"
         # -- Enable high performance swapper.
         # env["MIES_USE_MB_SWAPPER"] = "1"  # Atlas 300I Duo needs to unset this.
         env["MIES_RECOMPUTE_THRESHOLD"] = "0.5"
@@ -391,6 +389,7 @@ class AscendMindIEServer(InferenceServer):
 
         # - Listening config
         server_config["ipAddress"] = "0.0.0.0"
+        server_config.pop("managementIpAddress", None)
         server_config["allowAllZeroIpListening"] = True
         server_config["maxLinkNum"] = 1000
         server_config["port"] = self._model_instance.port
@@ -407,6 +406,10 @@ class AscendMindIEServer(InferenceServer):
 
         # - Model config
         max_seq_len = self._get_model_max_seq_len()
+        # -- Mutate default max sequence length (aka. context length),
+        #    but allow to change it with below advanced parameters.
+        if max_seq_len > 8192:
+            max_seq_len = 8192
         model_deploy_config["maxSeqLen"] = max_seq_len
         model_deploy_config["maxInputTokenLen"] = max_seq_len
         model_deploy_config["truncation"] = False
@@ -468,7 +471,8 @@ class AscendMindIEServer(InferenceServer):
                     }
                 )
             # --- Exposing metrics.
-            env["MIES_SERVICE_MONITOR_MODE"] = "1" if params.metrics else "0"
+            if params.metrics:
+                env["MIES_SERVICE_MONITOR_MODE"] = "1"
             # --- Emitting operators in synchronous way.
             env["TASK_QUEUE_ENABLE"] = "0" if params.enforce_eager else "1"
 
@@ -491,12 +495,24 @@ class AscendMindIEServer(InferenceServer):
         service_bin_path = service_path.joinpath("bin", "mindieservice_daemon")
 
         try:
+            # Display environment variables and JSON configuration.
             logger.info(f"Starting Ascend MindIE: {service_bin_path}")
-            env_view = env if logger.isEnabledFor(logging.DEBUG) else self._model.env
+            env_view = None
+            if logger.isEnabledFor(logging.DEBUG):
+                env_view = env
+            elif self._model.env:
+                # If the model instance has its own environment variables,
+                # display the mutated environment variables.
+                env_view = self._model.env
+                for k, v in self._model.env.items():
+                    env_view[k] = env.get(k, v)
+            if env_view:
+                logger.info(
+                    f"With environment variables(inconsistent input items mean unchangeable):{os.linesep}{os.linesep.join(f'{k}={v}' for k, v in sorted(env_view.items()))}"
+                )
             logger.info(
-                f"  With environment variables: {os.linesep}{os.linesep.join(f'{k}={v}' for k, v in sorted(env_view.items()))}"
+                f"With JSON configuration(inconsistent input items mean unchangeable):{os.linesep}{config_str}"
             )
-            logger.info(f"  With JSON configuration: {os.linesep}{config_str}")
 
             # Fork, inject environment variables and set working directory.
             proc = subprocess.Popen(

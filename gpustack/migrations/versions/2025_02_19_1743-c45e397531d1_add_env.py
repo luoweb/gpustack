@@ -13,6 +13,7 @@ import os
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 import sqlmodel
 import gpustack
 from gpustack.config.config import get_global_config
@@ -45,10 +46,16 @@ def upgrade() -> None:
             batch_op.add_column(sa.Column('restart_count', sa.Integer(), nullable=True))
             batch_op.add_column(sa.Column('last_restart_time', gpustack.schemas.common.UTCDateTime(), nullable=True))
 
+    conn = op.get_bind()
     if not table_exists('model_files'):
+        if conn.dialect.name == 'postgresql':
+            source_enum_type = postgresql.ENUM('HUGGING_FACE', 'OLLAMA_LIBRARY', 'MODEL_SCOPE', 'LOCAL_PATH', name='sourceenum', create_type=False)
+        else:
+            source_enum_type = sqlmodel.sql.sqltypes.AutoString()
+
         op.create_table('model_files',
         sa.Column('deleted_at', sa.DateTime(), nullable=True),
-        sa.Column('source', sa.Enum('HUGGING_FACE', 'OLLAMA_LIBRARY', 'MODEL_SCOPE', 'LOCAL_PATH', name='sourceenum'), nullable=False),
+        sa.Column('source', source_enum_type, nullable=False),
         sa.Column('huggingface_repo_id', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
         sa.Column('huggingface_filename', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
         sa.Column('ollama_library_model_name', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
@@ -56,7 +63,7 @@ def upgrade() -> None:
         sa.Column('model_scope_file_path', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
         sa.Column('local_path', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
         sa.Column('source_index', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
-        sa.Column('size', sa.Integer(), nullable=True),
+        sa.Column('size', sa.BigInteger(), nullable=True),
         sa.Column('download_progress', sa.Float(), nullable=True),
         sa.Column('resolved_paths', sa.JSON(), nullable=True),
         sa.Column('state', sa.Enum('ERROR', 'DOWNLOADING', 'READY', name='modelfilestateenum'), nullable=False),
