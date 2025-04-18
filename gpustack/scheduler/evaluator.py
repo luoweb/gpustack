@@ -28,6 +28,7 @@ from gpustack.schemas.models import (
     is_gguf_model,
 )
 from gpustack.utils.hub import (
+    auth_check,
     get_hugging_face_model_min_gguf_path,
     get_model_scope_model_min_gguf_path,
 )
@@ -110,8 +111,17 @@ async def evaluate_model_with_cache(
         )
         return evaluate_cache[cache_key]
 
-    result = await evaluate_model(config, session, model, workers)
-    evaluate_cache[cache_key] = result
+    try:
+        result = await evaluate_model(config, session, model, workers)
+        evaluate_cache[cache_key] = result
+    except Exception as e:
+        logger.error(
+            f"Error evaluating model {model.name or model.readable_source}: {e}"
+        )
+        result = ModelEvaluationResult(
+            compatible=False, error=True, error_message=str(e)
+        )
+
     return result
 
 
@@ -263,13 +273,33 @@ async def evaluate_model_metadata(
     model: ModelSpec,
 ) -> Tuple[bool, List[str]]:
     try:
+        if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(
+            model.local_path
+        ):
+            # The local path model is not accessible from the server.
+            return False, [
+                "The model file path you specified does not exist on the server. "
+                "It's recommended to place the model file at the same path on both the server and the worker. This helps GPUStack make better decisions."
+            ]
+
+        if model.source in [
+            SourceEnum.HUGGING_FACE,
+            SourceEnum.MODEL_SCOPE,
+        ]:
+            await run_in_thread(
+                auth_check,
+                timeout=15,
+                model=model,
+                huggingface_token=config.huggingface_token,
+            )
+
         if is_gguf_model(model):
             await scheduler.evaluate_gguf_model(config, model)
         elif is_audio_model(model):
             await scheduler.evaluate_audio_model(config, model)
         else:
             await scheduler.evaluate_pretrained_config(model)
-    except Exception as e:
+    except ValueError as e:
         return False, [str(e)]
 
     return True, []

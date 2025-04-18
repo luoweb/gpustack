@@ -119,7 +119,7 @@ def calculate_percentile(values, percentile, reverse=False):
 
 
 async def preflight_check(client, model) -> bool:
-    result = await make_request(client, model, 16, 5)
+    result = await make_request(client, model, 16, 60)
     return result is not None
 
 
@@ -191,6 +191,7 @@ async def main(
     ttft_list = [ttft for _, _, _, ttft in results if ttft is not None]
 
     successful_requests = len(results)
+    success_rate = successful_requests / num_requests if num_requests > 0 else 0
     requests_per_second = (
         successful_requests / total_elapsed_time if total_elapsed_time > 0 else 0
     )
@@ -199,6 +200,9 @@ async def main(
         sum(tokens_per_second_list) / len(tokens_per_second_list)
         if tokens_per_second_list
         else 0
+    )
+    overall_tokens_per_second = (
+        total_tokens / total_elapsed_time if total_elapsed_time > 0 else 0
     )
     avg_ttft = sum(ttft_list) / len(ttft_list) if ttft_list else 0
 
@@ -215,6 +219,7 @@ async def main(
         "model": model,
         "total_requests": num_requests,
         "successful_requests": successful_requests,
+        "success_rate": success_rate,
         "concurrency": concurrency,
         "request_timeout": request_timeout,
         "max_completion_tokens": max_completion_tokens,
@@ -228,6 +233,7 @@ async def main(
             "p99": latency_percentiles[2],
         },
         "tokens_per_second": {
+            "overall": overall_tokens_per_second,
             "average": avg_tokens_per_second,
             "p50": tps_percentiles[0],
             "p95": tps_percentiles[1],
@@ -243,12 +249,34 @@ async def main(
 
 
 def output_results(results, result_file=None):
+    # Round all floats in results to two decimal places for output
+    def _round_floats(obj, ndigits=2):
+        if isinstance(obj, dict):
+            return {k: _round_floats(v, ndigits) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_round_floats(v, ndigits) for v in obj]
+        if isinstance(obj, float):
+            return round(obj, ndigits)
+        return obj
+
+    formatted_results = _round_floats(results, 2)
     if result_file:
         with open(result_file, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(formatted_results, f, indent=2)
         logging.info(f"Results saved to {result_file}")
     else:
-        print(json.dumps(results, indent=2))
+        print(json.dumps(formatted_results, indent=2))
+
+
+def set_http_client(args):
+    if args.headers:
+        for header in args.headers:
+            if ":" not in header:
+                parser.error(f"Invalid header format: {header}. Expected Key:Value")
+            key, value = header.split(":", 1)
+            http_client.headers[key.strip()] = value.strip()
+
+    http_client.timeout = args.request_timeout
 
 
 if __name__ == "__main__":
@@ -294,7 +322,15 @@ if __name__ == "__main__":
         type=str,
         help="Result file path to save benchmark json results",
     )
+    parser.add_argument(
+        "-H",
+        "--header",
+        action="append",
+        dest="headers",
+        help="Custom HTTP header in Key:Value format. May be specified multiple times.",
+    )
     args = parser.parse_args()
+    set_http_client(args)
 
     results = asyncio.run(
         main(

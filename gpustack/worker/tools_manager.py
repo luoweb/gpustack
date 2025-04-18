@@ -21,7 +21,7 @@ from gpustack.utils import platform, envs
 logger = logging.getLogger(__name__)
 
 
-BUILTIN_LLAMA_BOX_VERSION = "v0.0.132"
+BUILTIN_LLAMA_BOX_VERSION = "v0.0.133"
 BUILTIN_GGUF_PARSER_VERSION = "v0.14.0"
 BUILTIN_RAY_VERSION = "2.43.0"
 
@@ -459,8 +459,6 @@ class ToolsManager:
         """
         Gets the appropriate CUDA version of the llama-box based on the system's CUDA version.
         """
-        if os.getenv("LLAMA_BOX_CUDA_VERSION", ""):
-            return os.getenv("LLAMA_BOX_CUDA_VERSION")
 
         default_version = "12.4"
         cuda_version = platform.get_cuda_version()
