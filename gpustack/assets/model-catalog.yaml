@@ -66,7 +66,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes:
     - 70
@@ -101,7 +101,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes:
     - 1
@@ -141,7 +141,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes: [8, 70, 405]
   licenses:
@@ -200,7 +200,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes: [0.5, 1.5, 3, 7, 14, 32, 72]
   licenses:
@@ -263,7 +263,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes: [0.5, 1.5, 3, 7, 14, 32]
   licenses:
     - apache-2.0
@@ -342,7 +342,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 32
   licenses:
@@ -374,7 +374,7 @@
   categories:
     - llm
   capabilities:
-    - context/32k
+    - context/32K
     - tools
   sizes:
     - 7
@@ -412,7 +412,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes:
     - 24
@@ -450,7 +450,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes:
     - 22
@@ -481,7 +481,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes:
     - 123
@@ -518,7 +518,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes:
     - 12
@@ -549,7 +549,7 @@
   categories:
     - llm
   capabilities:
-    - context/32k
+    - context/32K
   sizes:
     - 22
   licenses:
@@ -583,7 +583,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - vision
   sizes: [1, 4, 12, 27]
   licenses:
@@ -618,7 +618,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes: [2, 9, 27]
   licenses:
     - gemma
@@ -650,13 +650,13 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 3.8
-  licenses: 
+  licenses:
     - mit
   release_date: "2025-02-26"
-  templates: 
+  templates:
     - quantizations:
         - Q2_K_L
         - Q3_K_M
@@ -674,7 +674,7 @@
       distributed_inference_across_workers: true
     - quantizations: ["BF16"]
       source: huggingface
-      huggingface_repo_id: microsoft/Phi-4-mini-instruct 
+      huggingface_repo_id: microsoft/Phi-4-mini-instruct
       replicas: 1
       backend: vllm
 - name: Phi3.5 Mini
@@ -684,7 +684,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 3.8
   licenses:
@@ -718,7 +718,7 @@
   categories:
     - llm
   capabilities:
-    - context/16k
+    - context/16K
   sizes:
     - 14
   licenses:
@@ -745,7 +745,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 236
   licenses:
@@ -782,7 +782,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 671
   licenses:
@@ -819,7 +819,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 671
   licenses:
@@ -859,7 +859,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 1.5
     - 7
@@ -995,7 +995,7 @@
   categories:
     - llm
   capabilities:
-    - context/32k
+    - context/32K
   sizes: [6, 9, 34]
   licenses:
     - apache-2.0
@@ -1028,7 +1028,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 32
   licenses:
@@ -1055,7 +1055,7 @@
   categories:
     - llm
   capabilities:
-    - context/32k
+    - context/32K
   sizes: [1, 3, 7, 10]
   licenses:
     - falcon-llm-license
@@ -1074,6 +1074,43 @@
       huggingface_repo_id: tiiuae/Falcon3-{size}B-Instruct
       replicas: 1
       backend: vllm
+- name: Granite3.3
+  description: Granite3.3 is a family of 128K context length language models fine-tuned for improved reasoning and instruction-following capabilities. The models demonstrate significant improvements on benchmarks for measuring generic performance including AlpacaEval-2.0 and Arena-Hard, as well as in mathematics, coding, and instruction following.
+  home: https://www.ibm.com/granite
+  icon: /static/catalog_icons/ibm.png
+  categories:
+    - llm
+  capabilities:
+    - context/128K
+    - tools
+  sizes: [2, 8]
+  licenses:
+    - apache-2.0
+  release_date: "2025-04-16"
+  templates:
+    - quantizations:
+        - Q2_K
+        - Q3_K_L
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K
+        - Q8_0
+        - f16
+      source: huggingface
+      huggingface_repo_id: ibm-granite/granite-3.3-{size}b-instruct-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+    - quantizations: ["BF16"]
+      source: huggingface
+      huggingface_repo_id: ibm-granite/granite-3.3-{size}b-instruct
+      replicas: 1
+      backend: vllm
+      backend_parameters:
+        - --enable-auto-tool-choice
+        - --tool-call-parser=granite
 - name: Granite3.1
   description: Granite is a family of AI models purpose-built for business, engineered from the ground up to ensure trust and scalability in AI-driven applications.
   home: https://www.ibm.com/granite
@@ -1081,7 +1118,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes: [2, 8]
   licenses:
@@ -1111,7 +1148,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - tools
   sizes:
     - 70
@@ -1149,7 +1186,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
   sizes:
     - 9
   licenses:
@@ -1192,7 +1229,7 @@
   categories:
     - llm
   capabilities:
-    - context/32k
+    - context/32K
     - vision
   sizes: [3, 7, 32, 72]
   licenses:
@@ -1217,7 +1254,7 @@
   categories:
     - llm
   capabilities:
-    - context/32k
+    - context/32K
     - vision
   sizes: [2, 7, 72]
   licenses:
@@ -1270,7 +1307,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - vision
   sizes:
     - 72
@@ -1306,7 +1343,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - vision
   sizes:
     - 11
@@ -1331,7 +1368,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - vision
   sizes:
     - 12
@@ -1353,7 +1390,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - vision
   sizes:
     - 5
@@ -1375,7 +1412,7 @@
   categories:
     - llm
   capabilities:
-    - context/128k
+    - context/128K
     - vision
   sizes:
     - 4
@@ -1397,7 +1434,7 @@
   categories:
     - llm
   capabilities:
-    - context/32k
+    - context/32K
     - vision
   sizes: [1, 2, 8, 9, 14, 38, 78]
   licenses:
@@ -1418,7 +1455,7 @@
   categories:
     - llm
   capabilities:
-    - context/32k
+    - context/32K
     - vision
   sizes: [1, 2, 4, 8, 26, 38, 78]
   licenses:

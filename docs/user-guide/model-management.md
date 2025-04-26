@@ -201,6 +201,10 @@ For example, use `--ctx-size=8192` for llama-box.
 
 For full list of supported parameters, please refer to the [Inference Backends](./inference-backends.md) section.
 
+### Environment Variables
+
+Environment variables used when running the model. These variables are passed to the backend process at startup.
+
 ### Allow CPU Offloading
 
 !!! note
@@ -213,6 +217,10 @@ After enabling CPU offloading, GPUStack prioritizes loading as many layers as po
 
 !!! note
 
-    Available for llama-box backend only.
+    Available for llama-box and vLLM backends.
 
 Enable distributed inference across multiple workers. The primary Model Instance will communicate with backend instances on one or more other workers, offloading computation tasks to them.
+
+### Auto-Restrat on Error
+
+Enable automatic restart of the model instance if it encounters an error. This feature ensures high availability and reliability of the model instance. If an error occurs, GPUStack will automatically attempt to restart the model instance using an exponential backoff strategy. The delay between restart attempts increases exponentially, up to a maximum interval of 5 minutes. This approach prevents the system from being overwhelmed by frequent restarts in the case of persistent errors.

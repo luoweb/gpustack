@@ -100,6 +100,7 @@ class Config(BaseSettings):
     force_auth_localhost: bool = False
     ollama_library_base_url: Optional[str] = "https://registry.ollama.ai"
     disable_update_check: bool = False
+    disable_openapi_docs: bool = False
     update_check_url: Optional[str] = None
     model_catalog_file: Optional[str] = None
     ray_port: int = 40096
@@ -158,6 +159,8 @@ class Config(BaseSettings):
 
         if self.system_reserved is None:
             self.system_reserved = {"ram": 2, "vram": 1}
+
+        self.make_dirs()
 
     @model_validator(mode="after")
     def check_all(self):  # noqa: C901
@@ -227,6 +230,12 @@ class Config(BaseSettings):
             raise Exception("Port range must be numeric")
         if int(ports[0]) > int(ports[1]):
             raise Exception(f"Invalid port range: {ports[0]} > {ports[1]}")
+
+    def make_dirs(self):
+        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.bin_dir, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
 
     def get_system_info(self) -> SystemInfo:  # noqa: C901
         """get system info from resources

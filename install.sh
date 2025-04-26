@@ -1,5 +1,5 @@
 #!/bin/sh
-# Script updated at: 2025-02-19T08:16:49Z
+# Script updated at: 2025-04-24T06:27:59Z
 set -e
 set -o noglob
 
@@ -498,6 +498,7 @@ After=network-online.target
 [Service]
 EnvironmentFile=-/etc/default/%N
 ExecStart=$(which gpustack) start $_args
+LimitNOFILE=65535
 Restart=always
 StandardOutput=append:/var/log/gpustack.log
 StandardError=append:/var/log/gpustack.log

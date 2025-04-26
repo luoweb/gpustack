@@ -42,9 +42,15 @@ extra:
   generator: false
   version:
     provider: mike
+extra_javascript:
+  - javascripts/katex.js
+  - https://unpkg.com/katex@0/dist/katex.min.js
+  - https://unpkg.com/katex@0/dist/contrib/auto-render.min.js
 extra_css:
   - stylesheets/extra.css
+  - https://unpkg.com/katex@0/dist/katex.min.css
 markdown_extensions:
+  - md_in_html
   - pymdownx.highlight
   - pymdownx.superfences
   - pymdownx.tabbed:
@@ -58,6 +64,8 @@ markdown_extensions:
   - pymdownx.inlinehilite
   - pymdownx.tasklist:
       custom_checkbox: true
+  - pymdownx.arithmatex:
+      generic: true
 repo_url: https://github.com/gpustack/gpustack
 edit_uri: edit/main/docs/
 nav:
@@ -97,10 +105,12 @@ nav:
           - Rerank: user-guide/playground/rerank.md
       - Model Management: user-guide/model-management.md
       - Model Catalog: user-guide/model-catalog.md
+      - Model File management: user-guide/model-file-management.md
       - API Key Management: user-guide/api-key-management.md
       - User Management: user-guide/user-management.md
       - Inference Backends: user-guide/inference-backends.md
       - Pinned Backend Versions: user-guide/pinned-backend-versions.md
+      - Compatibility Check: user-guide/compatibility-check.md
       - OpenAI Compatible APIs: user-guide/openai-compatible-apis.md
       - Image Generation APIs: user-guide/image-generation-apis.md
       - Rerank API: user-guide/rerank-api.md
@@ -114,6 +124,7 @@ nav:
       - Editing Images: using-models/editing-images.md
       - Using Audio Models: using-models/using-audio-models.md
   - Tutorials:
+      - Running DeepSeek R1 671B with Distributed vLLM: tutorials/running-deepseek-r1-671b-with-distributed-vllm.md
       - Performing Distributed Inference Across Workers (llama-box): tutorials/performing-distributed-inference-across-workers-llama-box.md
       - Inference On CPUs: tutorials/inference-on-cpus.md
       - Inference with Tool Calling: tutorials/inference-with-tool-calling.md
