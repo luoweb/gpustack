@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import os
 import queue
@@ -35,12 +36,14 @@ from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.policies.worker_filters.status_filter import StatusFilter
 from gpustack.schemas.workers import Worker
 from gpustack.schemas.models import (
+    BackendEnum,
     CategoryEnum,
     DistributedServers,
     Model,
     ModelInstance,
     ModelInstanceStateEnum,
     SourceEnum,
+    get_backend,
     is_gguf_model,
     is_audio_model,
 )
@@ -154,19 +157,30 @@ class Scheduler:
                     return
 
                 should_update_model = False
-                if is_gguf_model(model):
-                    should_update_model = await evaluate_gguf_model(self._config, model)
-                    if await self.check_model_distributability(
-                        session, model, instance
-                    ):
-                        return
-                elif is_audio_model(model):
-                    should_update_model = await evaluate_audio_model(
-                        self._config, model
-                    )
-                else:
-                    should_update_model = await evaluate_pretrained_config(
-                        model, raise_raw=True
+                try:
+                    if is_gguf_model(model):
+                        should_update_model = await evaluate_gguf_model(
+                            self._config, model
+                        )
+                        if await self.check_model_distributability(
+                            session, model, instance
+                        ):
+                            return
+                    elif is_audio_model(model):
+                        should_update_model = await evaluate_audio_model(
+                            self._config, model
+                        )
+                    else:
+                        should_update_model = await evaluate_pretrained_config(
+                            model, raise_raw=True
+                        )
+                except Exception as e:
+                    # Even if the evaluation failed, we still want to proceed to deployment.
+                    # Cases can be:
+                    # 1. Model config is not valid, but is overridable by backend parameters.
+                    # 2. It may not be required to be transformer-compatible for certain backends.
+                    logger.error(
+                        f"Failed to evaluate model {model.name or model.readable_source}: {e}"
                     )
 
                 if should_update_model:
@@ -493,44 +507,66 @@ async def evaluate_pretrained_config(model: Model, raise_raw: bool = False) -> b
     Returns:
         True if the model's categories are updated, False otherwise.
     """
-    try:
-        pretrained_config = await run_in_thread(
-            get_pretrained_config, timeout=30, model=model
-        )
-    except ValueError as e:
-        # Skip value error exceptions and defaults to LLM catagory for certain cases.
-        if should_skip_architecture_check(model):
-            model.categories = model.categories or [CategoryEnum.LLM]
-            return True
-
-        if raise_raw:
-            raise
-
-        logger.debug(
-            f"Failed to get config for model {model.name or model.readable_source}: {e}"
-        )
-        raise simplify_auto_config_value_error(e)
-    except TimeoutError:
-        raise Exception(
-            f"Timeout while getting config for model {model.name or model.readable_source}."
-        )
-    except Exception as e:
-        raise Exception(
-            f"Failed to get config for model {model.name or model.readable_source}: {e}"
-        )
-
-    architectures = getattr(pretrained_config, "architectures", []) or []
+    # Check overrided architectures if specified in backend parameters.
+    architectures = get_vllm_override_architectures(model)
     if not architectures:
-        raise ValueError("Not a supported model. Unrecognized architecture.")
+        try:
+            pretrained_config = await run_in_thread(
+                get_pretrained_config, timeout=30, model=model
+            )
+        except ValueError as e:
+            # Skip value error exceptions and defaults to LLM catagory for certain cases.
+            if should_skip_architecture_check(model):
+                model.categories = model.categories or [CategoryEnum.LLM]
+                return True
+
+            if raise_raw:
+                raise
+
+            logger.debug(
+                f"Failed to get config for model {model.name or model.readable_source}: {e}"
+            )
+            raise simplify_auto_config_value_error(e)
+        except TimeoutError:
+            raise Exception(
+                f"Timeout while getting config for model {model.name or model.readable_source}."
+            )
+        except Exception as e:
+            raise Exception(
+                f"Failed to get config for model {model.name or model.readable_source}: {e}"
+            )
+
+        architectures = getattr(pretrained_config, "architectures", []) or []
+        if not architectures and not model.backend_version:
+            raise ValueError("Not a supported model. Unrecognized architecture.")
 
     model_type = detect_model_type(architectures)
 
-    if model_type == CategoryEnum.UNKNOWN:
+    if model_type == CategoryEnum.UNKNOWN and not model.backend_version:
         raise ValueError(
             f"Not a supported model. Detected architectures: {architectures}."
         )
 
     return set_model_categories(model, model_type)
+
+
+def get_vllm_override_architectures(model: Model) -> List[str]:
+    """
+    Get the vLLM override architectures from the model's backend parameters.
+    Args:
+        model: Model to check.
+    Returns:
+        List of override architectures.
+    """
+    backend = get_backend(model)
+    if backend != BackendEnum.VLLM:
+        return []
+
+    hf_overrides = find_parameter(model.backend_parameters, ["hf-overrides"])
+    if hf_overrides:
+        overrides_dict = json.loads(hf_overrides)
+        return overrides_dict.get("architectures", [])
+    return []
 
 
 def should_skip_architecture_check(model: Model) -> bool:
@@ -583,6 +619,10 @@ def set_model_categories(model: Model, model_type: CategoryEnum) -> bool:
         model.reranker = True
         return True
     elif model_type == CategoryEnum.LLM:
+        model.categories = [CategoryEnum.LLM]
+        return True
+    elif model_type == CategoryEnum.UNKNOWN:
+        # Default to LLM for unknown architectures
         model.categories = [CategoryEnum.LLM]
         return True
 

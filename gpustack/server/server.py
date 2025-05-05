@@ -1,6 +1,7 @@
 import asyncio
 from multiprocessing import Process
 import os
+import re
 from typing import List
 import uvicorn
 import logging
@@ -9,7 +10,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.logging import setup_logging
 from gpustack.schemas.users import User
 from gpustack.security import JWTManager, generate_secure_password, get_secret_hash
-from gpustack.server.app import app
+from gpustack.server.app import create_app
 from gpustack.config import Config
 from gpustack.server.catalog import init_model_catalog
 from gpustack.server.controllers import (
@@ -80,6 +81,7 @@ class Server:
 
         jwt_manager = JWTManager(self._config.jwt_secret_key)
         # Start FastAPI server
+        app = create_app(self._config)
         app.state.server_config = self._config
         app.state.jwt_manager = jwt_manager
         if self._config.enable_cors:
@@ -124,7 +126,13 @@ class Server:
         alembic_cfg.set_main_option(
             "script_location", os.path.join(pkg_path, "migrations")
         )
-        alembic_cfg.set_main_option("sqlalchemy.url", self._config.database_url)
+
+        db_url = self._config.database_url
+        # Use the pymysql driver to execute migrations to avoid compatibility issues between asynchronous drivers and Alembic.
+        if db_url.startswith("mysql://"):
+            db_url = re.sub(r'^mysql://', 'mysql+pymysql://', db_url)
+
+        alembic_cfg.set_main_option("sqlalchemy.url", db_url)
         command.upgrade(alembic_cfg, "head")
         logger.info("Database migration completed.")
 

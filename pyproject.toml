@@ -20,7 +20,7 @@ prometheus-client = "^0.20.0"
 colorama = "^0.4.6"
 psutil = "^7.0.0"
 requests = "^2.32.3"
-huggingface-hub = "^0.30.0"
+huggingface-hub = {extras = ["hf-xet"], version = "^0.30.2"}
 attrs = "^24.2.0"
 aiosqlite = "^0.20.0"
 sqlalchemy = {extras = ["asyncio"], version = "^2.0.30"}
@@ -39,7 +39,7 @@ cryptography = "^43.0.0"
 tzdata = "^2024.1"
 modelscope = ">=1.22.3,<1.23"
 ray = {version = "2.43.0", extras = ["default"]} # Align with BUILTIN_RAY_VERSION in tools_manager.py
-vllm = {version = "0.8.4", optional = true}
+vllm = {version = "0.8.5", optional = true}
 mistral_common = {version = "^1.4.3", optional = true, extras = ["opencv"]}
 uvicorn = "^0.32.0"
 transformers = "^4.51.1"
@@ -57,9 +57,13 @@ aiohttp = "^3.11.2"
 bitsandbytes = {version = "^0.45.2", optional = true}
 python-json-logger = "^3.3.0"
 hf-transfer = "^0.1.9"
+asyncmy = "^0.2.10"
+pymysql = "^1.1.1"
 
 pyarrow = "*"
 pandas = "*"
+blobfile = "^3.0.0"
+timm = {version = "^1.0.15", optional = true}
 [tool.poetry.group.dev.dependencies]
 coverage = {extras = ["toml"], version = "^7.5.1"}
 flake8 = "^7.0.0"
@@ -92,7 +96,7 @@ force-exclude = '''
 '''
 
 [tool.poetry.extras]
-vllm = ["vllm", "mistral_common", "bitsandbytes"]
+vllm = ["vllm", "mistral_common", "bitsandbytes", "timm"]
 audio = ["vox-box"]
 all = ["vllm", "mistral_common", "bitsandbytes", "vox-box"]
 
