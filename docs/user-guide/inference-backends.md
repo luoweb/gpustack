@@ -39,9 +39,19 @@ Enable distributed inference across multiple workers. The primary Model Instance
 
 #### Multimodal Language Models
 
-Llama-box supports the following multimodal language models. When using a vision language model, image inputs are supported in the chat completion API.
+Llama-box supports the following vision language models. When using a vision language model, image inputs are supported in the chat completion API.
 
-- Qwen2-VL
+- LLaVA Series
+- MiniCPM VL Series
+- Qwen2 VL Series
+- GLM-Edge-V Series
+- Granite VL Series
+- Gemma3 VL Series
+- SmolVLM Series
+- Pixtral Series
+- MobileVLM Series
+- Mistral Small 3.1
+- Qwen2.5 VL Series
 
 !!! Note
 
@@ -91,6 +101,7 @@ vLLM supports distributed inference across multiple workers using [Ray](https://
     1. The GPUStack server and all participating workers must run on Linux and use the same version of Python, which is a requirement of Ray.
     2. Model files must be accessible at the same path on all participating workers. You must either use a shared file system or download the model files to the same path on all participating workers.
     3. Each worker can only be assigned to one distributed vLLM model instance at a time.
+    4. If you install GPUStack with Docker, you need to use the host network mode to leverage RDMA/InfiniBand and ensure connectivity between Ray nodes.
 
 Auto-scheduling is supported with the following conditions:
 
@@ -161,32 +172,32 @@ The Ascend MindIE backend works on Linux platforms only, including ARM64 and x86
 ### Supported Models
 
 Ascend MindIE supports various models
-listed [here](https://www.hiascend.com/document/detail/zh/mindie/100/whatismindie/mindie_what_0003.html).
+listed [here](https://www.hiascend.com/document/detail/zh/mindie/20RC1/modellist/mindie_modellist_0001.html).
 
 Within GPUStack, support
-[large language models (LLMs)](https://www.hiascend.com/document/detail/zh/mindie/100/whatismindie/mindie_what_0003.html)
+[large language models (LLMs)](https://www.hiascend.com/document/detail/zh/mindie/20RC1/modellist/mindie_modellist_0001.html)
 and
-[multimodal language models (VLMs)](https://www.hiascend.com/document/detail/zh/mindie/100/whatismindie/mindie_what_0004.html)
+[multimodal language models (VLMs)](https://www.hiascend.com/document/detail/zh/mindie/20RC1/modellist/mindie_modellist_0002.html)
 . However, _embedding models_ and _multimodal generation models_ are not supported yet.
 
 ### Supported Features
 
 Ascend MindIE owns a variety of features
-outlined [here](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0001.html).
+outlined [here](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0001.html).
 
 At present, GPUStack supports a subset of these capabilities, including
-[Quantization](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0288.html),
-[Extending Context Size](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0295.html),
-[Mixture of Experts(MoE)](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0297.html),
-[Prefix Caching](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0302.html),
-[Function Calling](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0303.html),
-[Multimodal Understanding](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0304.html),
-[Multi-head Latent Attention(MLA)](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0305.html).
+[Quantization](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0288.html),
+[Extending Context Size](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0295.html),
+[Mixture of Experts(MoE)](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0297.html),
+[Prefix Caching](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0302.html),
+[Function Calling](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0303.html),
+[Multimodal Understanding](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0304.html),
+[Multi-head Latent Attention(MLA)](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0305.html).
 
 !!! Note
 
     1. Quantization needs specific weight, and must adjust the model's `config.json`,
-       please follow the [reference(guide)](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0288.html) to prepare the correct weight.
+       please follow the [reference(guide)](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0288.html) to prepare the correct weight.
     2. For Multimodal Understanding feature, some versions of Ascend MindIE's API are incompatible with OpenAI,
        please track this [issue](https://github.com/gpustack/gpustack/issues/1803) for more support.
     3. Some features are mutually exclusive, so be careful when using them.
@@ -194,16 +205,18 @@ At present, GPUStack supports a subset of these capabilities, including
 ### Parameters Reference
 
 Ascend MindIE has
-configurable [parameters](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0004.html)
-and [environment variables](https://www.hiascend.com/document/detail/zh/mindie/100/mindiellm/llmdev/mindie_llm0416.html).
+configurable [parameters](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0004.html)
+and [environment variables](https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0416.html).
 
 To avoid directly configuring JSON, GPUStack provides a set of command line parameters as below.
 
 | Parameter                        | Default | Description                                                                                                                                                                                            |
-|----------------------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| -------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--trust-remote-code`            |         | Trust remote code (for model loading).                                                                                                                                                                 |
 | `--npu-memory-fraction`          | 0.9     | Fraction of NPU memory to be used for the model executor (0 to 1). For example: `0.5` means 50% memory utilization.                                                                                    |
 | `--max-link-num`                 | 1000    | Maximum number of parallel requests.                                                                                                                                                                   |
+| `--token-timeout`                | 60      | Timeout for a token generation in seconds.                                                                                                                                                             |
+| `--e2e-timeout`                  | 60      | E2E (from request accepted to inference stopped) timeout in seconds.                                                                                                                                   |
 | `--max-seq-len`                  | 8192    | Model context length. If unspecified, it will be derived from the model config.                                                                                                                        |
 | `--max-input-token-len`          |         | Maximum input token length. If unspecified, it will be derived from `--max-seq-len`.                                                                                                                   |
 | `--truncation`                   |         | Truncate the input token length when it exceeds the minimum of `--max-input-token-len` and `--max-seq-len` - 1.                                                                                        |

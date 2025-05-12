@@ -17,11 +17,12 @@ from gpustack.schemas.models import BackendEnum
 from gpustack.utils.command import get_versioned_command
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils import platform, envs
+from gpustack.config.config import get_global_config
 
 logger = logging.getLogger(__name__)
 
 
-BUILTIN_LLAMA_BOX_VERSION = "v0.0.138"
+BUILTIN_LLAMA_BOX_VERSION = "v0.0.139"
 BUILTIN_GGUF_PARSER_VERSION = "v0.14.1"
 BUILTIN_RAY_VERSION = "2.43.0"
 
@@ -313,7 +314,7 @@ class ToolsManager:
 
         try:
             logger.info(f"Installing {package} {version} using pipx")
-            subprocess.run(install_command, capture_output=True, check=True, text=True)
+            subprocess.run(install_command, check=True, text=True)
 
             installed_bin_path = pipx_bin_path / f"{package}{suffix}"
             if not installed_bin_path.exists():
@@ -345,7 +346,6 @@ class ToolsManager:
             logger.info(f"Injecting {package} into pipx environment '{env_name}'")
             subprocess.run(
                 [pipx_path, "inject", env_name, package, "--force"],
-                capture_output=True,
                 check=True,
                 text=True,
             )
@@ -751,7 +751,8 @@ class ToolsManager:
         """Install Ascend MindIE run package to the target directory."""
 
         # Create a virtual environment to collect the new Python packages.
-        venv_parent_dir = Path("/var/lib/gpustack/venvs/mindie")
+        cfg = get_global_config()
+        venv_parent_dir = Path(cfg.data_dir).joinpath("venvs", "mindie")
         venv_parent_dir.mkdir(parents=True, exist_ok=True)
         try:
             subprocess.check_call(

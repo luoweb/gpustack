@@ -22,7 +22,7 @@ Check if the CPU is supported:
 grep -E -i "neon|asimd" /proc/cpuinfo
 ```
 
-- [NPU Driver and Firmware](https://www.hiascend.com/hardware/firmware-drivers/community?product=4&model=26&cann=8.0.0.beta1&driver=1.0.28.alpha) (Must support CANN 8.0.0.beta1)
+- [NPU Driver and Firmware](https://www.hiascend.com/hardware/firmware-drivers/community) (Must support CANN 8.1.RC1.beta1)
 
 Check if the NPU driver is installed:
 
@@ -85,7 +85,7 @@ Run the following command to start the GPUStack server **and built-in worker** (
             -v /etc/ascend_install.info:/etc/ascend_install.info \
             -p 80:80 \
             -p 10150:10150 \
-            -p 40064-40131:40064-40131 \
+            -p 40064-40095:40064-40095 \
             --ipc=host \
             -v gpustack-data:/var/lib/gpustack \
             gpustack/gpustack:latest-npu \
@@ -132,7 +132,7 @@ Run the following command to start the GPUStack server **and built-in worker** (
             -v /etc/ascend_install.info:/etc/ascend_install.info \
             -p 80:80 \
             -p 10150:10150 \
-            -p 40064-40131:40064-40131 \
+            -p 40064-40095:40064-40095 \
             --ipc=host \
             -v gpustack-data:/var/lib/gpustack \
             gpustack/gpustack:latest-npu-310p \
@@ -163,7 +163,7 @@ To get the token used for adding workers, run the following command on the GPUSt
 docker exec -it gpustack cat /var/lib/gpustack/token
 ```
 
-To start GPUStack as a worker, and **register it with the GPUStack server** (Set `ASCEND_VISIBLE_DEVICES` to the required GPU indices), run the following command on the **worker node**. Be sure to replace the URL, token and node IP with your specific values:
+To start GPUStack as a worker, and **register it with the GPUStack server** (Set `--device /dev/davinci{index}` to the required GPU indices), run the following command on the **worker node**. Be sure to replace the URL, token and node IP with your specific values:
 
 === "Ascend 910B"
 
@@ -205,7 +205,7 @@ To start GPUStack as a worker, and **register it with the GPUStack server** (Set
             -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
             -v /etc/ascend_install.info:/etc/ascend_install.info \
             -p 10150:10150 \
-            -p 40064-40131:40064-40131 \
+            -p 40064-40095:40064-40095 \
             --ipc=host \
             -v gpustack-data:/var/lib/gpustack \
             gpustack/gpustack:latest-npu \
@@ -252,7 +252,7 @@ To start GPUStack as a worker, and **register it with the GPUStack server** (Set
             -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
             -v /etc/ascend_install.info:/etc/ascend_install.info \
             -p 10150:10150 \
-            -p 40064-40131:40064-40131 \
+            -p 40064-40095:40064-40095 \
             --ipc=host \
             -v gpustack-data:/var/lib/gpustack \
             gpustack/gpustack:latest-npu-310p \
@@ -268,7 +268,7 @@ To start GPUStack as a worker, and **register it with the GPUStack server** (Set
 
     3. You can either use the `--ipc=host` flag or `--shm-size` flag to allow the container to access the host’s shared memory. It is used by vLLM and pyTorch to share data between processes under the hood, particularly for tensor parallel inference.
 
-    4. The  `-p 40064-40131:40064-40131` flag is used to ensure connectivity for distributed inference across workers. For more details, please refer to the [Port Requirements](../installation-requirements.md#port-requirements). You can omit this flag if you don't need distributed inference across workers.
+    4. The  `-p 40064-40095:40064-40095` flag is used to ensure connectivity for distributed inference across workers running llama-box RPC servers. For more details, please refer to the [Port Requirements](../installation-requirements.md#port-requirements). You can omit this flag if you don't need distributed inference across workers.
 
 ## Installation Script
 
@@ -278,15 +278,15 @@ To start GPUStack as a worker, and **register it with the GPUStack server** (Set
 
 ### Prerequites
 
-- [Ascend CANN Toolkit 8.0.0.beta1 & Kernels](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.0.0.beta1)
+- [Ascend CANN Toolkit 8.1.RC1.beta1 & Kernels](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.0.0.beta1)
 
-Check if CANN is installed and verify that its version is 8.0.0:
+Check if CANN is installed and verify that its version is 8.1.RC1:
 
 ```bash
 cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg
 ```
 
-Check if CANN kernels are installed and verify that its version is 8.0.0:
+Check if CANN kernels are installed and verify that its version is 8.1.RC1:
 
 ```bash
 cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg | grep opp

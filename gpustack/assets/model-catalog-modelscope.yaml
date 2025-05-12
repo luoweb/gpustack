@@ -558,6 +558,7 @@
   capabilities:
     - context/128K
     - tools
+    - vision
   sizes:
     - 24
   licenses:
@@ -571,7 +572,6 @@
         - Q5_K_M
         - Q6_K
         - Q8_0
-        - BF16
       source: model_scope
       model_scope_model_id: unsloth/Mistral-Small-3.1-24B-Instruct-2503-GGUF
       model_scope_file_path: "*-{quantization}*.gguf"
@@ -735,16 +735,14 @@
   release_date: "2025-03-12"
   templates:
     - quantizations:
-        - UD-IQ1_M
         - Q2_K_L
         - Q3_K_M
         - Q4_K_M
         - Q5_K_M
-        - Q6_K
+        - Q6_K_L
         - Q8_0
-        - BF16
       source: model_scope
-      model_scope_model_id: unsloth/gemma-3-{size}b-it-GGUF
+      model_scope_model_id: bartowski/google_gemma-3-{size}b-it-GGUF
       model_scope_file_path: "*-{quantization}*.gguf"
       replicas: 1
       backend: llama-box
@@ -1446,6 +1444,20 @@
     - qwen
   release_date: "2025-01-26"
   templates:
+    - quantizations:
+        - Q4_K_M
+        - Q8_0
+        - f16
+      sizes: [3, 7, 72] # 32B is missing in modelscope
+      source: model_scope
+      model_scope_model_id: ggml-org/Qwen2.5-VL-{size}B-Instruct-GGUF
+      model_scope_file_path: "Qwen2.5-VL-*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      backend_parameters:
+        - --visual-max-image-size=1344
+      cpu_offloading: true
+      distributed_inference_across_workers: true
     - quantizations: ["BF16"]
       source: model_scope
       model_scope_model_id: Qwen/Qwen2.5-VL-{size}B-Instruct
@@ -1585,6 +1597,20 @@
     - apache-2.0
   release_date: "2024-09-11"
   templates:
+    - quantizations:
+        - Q2_K_L
+        - Q3_K_M
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K_L
+        - Q8_0
+      source: model_scope
+      model_scope_model_id: bartowski/mistral-community_pixtral-12b-GGUF
+      model_scope_file_path: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
     - quantizations: ["BF16"]
       source: model_scope
       model_scope_model_id: unsloth/Pixtral-12B-2409
@@ -1737,6 +1763,8 @@
       backend: vllm
       backend_parameters:
         - --trust-remote-code
+      env:
+        GPUSTACK_MODEL_VRAM_CLAIM: "92341796864" # Claim 86GB VRAM
 - name: Kimi VL Thinking
   description: Kimi-VL is an efficient open-source Mixture-of-Experts (MoE) vision-language model (VLM) that offers advanced multimodal reasoning, long-context understanding, and strong agent capabilities.
   home: https://github.com/opengvlab
@@ -1758,6 +1786,8 @@
       backend: vllm
       backend_parameters:
         - --trust-remote-code
+      env:
+        GPUSTACK_MODEL_VRAM_CLAIM: "92341796864" # Claim 86GB VRAM
 # Embedding models
 - name: BGE M3
   description: BGE-M3 is a new model from BAAI distinguished for its versatility in Multi-Functionality, Multi-Linguality, and Multi-Granularity.

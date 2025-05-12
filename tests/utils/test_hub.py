@@ -106,9 +106,9 @@ def test_get_hub_model_weight_size():
         (
             Model(
                 source=SourceEnum.MODEL_SCOPE,
-                model_scope_model_id="iic/CosyVoice2-0.5B",
+                model_scope_model_id="gpustack/CosyVoice2-0.5B",
             ),
-            3_995_851_361,
+            3_545_354_370,
         ),
     ]
 
@@ -140,7 +140,7 @@ def test_get_hf_min_gguf_file():
         ),
         (
             "unsloth/Llama-3.3-70B-Instruct-GGUF",
-            "Llama-3.3-70B-Instruct-Q2_K.gguf",
+            "Llama-3.3-70B-Instruct-UD-IQ1_M.gguf",
         ),
         (
             "unsloth/DeepSeek-R1-GGUF",
@@ -171,7 +171,7 @@ def test_get_ms_min_gguf_file():
         ),
         (
             "unsloth/Llama-3.3-70B-Instruct-GGUF",
-            "Llama-3.3-70B-Instruct-Q2_K.gguf",
+            "Llama-3.3-70B-Instruct-UD-IQ1_M.gguf",
         ),
         (
             "unsloth/DeepSeek-R1-GGUF",

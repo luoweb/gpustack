@@ -6,6 +6,7 @@ import os
 from typing import List, Tuple
 from sqlmodel.ext.asyncio.session import AsyncSession
 from cachetools import TTLCache
+from aiolimiter import AsyncLimiter
 
 from gpustack.api.exceptions import HTTPException
 from gpustack.config.config import Config, VendorEnum
@@ -42,6 +43,10 @@ EVALUATION_CACHE_MAX_SIZE = int(
 )
 EVALUATION_CACHE_TTL = int(os.environ.get("GPUSTACK_MODEL_EVALUATION_CACHE_TTL", 3600))
 evaluate_cache = TTLCache(maxsize=EVALUATION_CACHE_MAX_SIZE, ttl=EVALUATION_CACHE_TTL)
+
+# To reduce the likelihood of hitting the Hugging Face API rate limit (600 RPM)
+# Limit the number of concurrent evaluations to 50 per 10 seconds
+evaluate_model_limiter = AsyncLimiter(50, 10)
 
 
 @time_decorator
@@ -112,8 +117,9 @@ async def evaluate_model_with_cache(
         return evaluate_cache[cache_key]
 
     try:
-        result = await evaluate_model(config, session, model, workers)
-        evaluate_cache[cache_key] = result
+        async with evaluate_model_limiter:
+            result = await evaluate_model(config, session, model, workers)
+            evaluate_cache[cache_key] = result
     except Exception as e:
         logger.error(
             f"Error evaluating model {model.name or model.readable_source}: {e}"
@@ -134,9 +140,7 @@ async def evaluate_model(
 ) -> ModelEvaluationResult:
     result = ModelEvaluationResult()
 
-    default_backend_parameters = get_catalog_model_spec_backend_parameter(model)
-    if default_backend_parameters and not model.backend_parameters:
-        model.backend_parameters = default_backend_parameters
+    if set_default_spec(model):
         result.default_spec = model.model_copy()
 
     await set_gguf_model_file_path(config, model)
@@ -318,10 +322,25 @@ async def evaluate_model_metadata(
             await scheduler.evaluate_audio_model(config, model)
         else:
             await scheduler.evaluate_pretrained_config(model)
+
+        set_default_worker_selector(model)
     except ValueError as e:
         return False, [str(e)]
 
     return True, []
+
+
+def set_default_worker_selector(
+    model: ModelSpec,
+) -> ModelSpec:
+    if (
+        not model.worker_selector
+        and not model.gpu_selector
+        and get_backend(model) == BackendEnum.VLLM
+    ):
+        # vLLM models are only supported on Linux
+        model.worker_selector = {"os": "linux"}
+    return model
 
 
 async def evaluate_model_input(
@@ -338,8 +357,20 @@ async def evaluate_model_input(
     return True, []
 
 
-def get_catalog_model_spec_backend_parameter(model: ModelSpec) -> List[str]:
+def set_default_spec(model: ModelSpec) -> bool:
+    """
+    Set the default spec for the model if it matches the catalog spec.
+    """
     model_spec_in_catalog = model_set_specs_by_key.get(model.model_source_key)
+
+    modified = False
     if model_spec_in_catalog:
-        return model_spec_in_catalog.backend_parameters
-    return []
+        if model_spec_in_catalog.backend_parameters and not model.backend_parameters:
+            model.backend_parameters = model_spec_in_catalog.backend_parameters
+            modified = True
+
+        if model_spec_in_catalog.env and not model.env:
+            model.env = model_spec_in_catalog.env
+            modified = True
+
+    return modified
