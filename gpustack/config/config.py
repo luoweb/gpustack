@@ -17,6 +17,7 @@ from gpustack.schemas.workers import (
     UptimeInfo,
     VendorEnum,
     GPUDevicesInfo,
+    GPUNetworkInfo,
 )
 from gpustack.utils import platform
 from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
@@ -346,7 +347,7 @@ class Config(BaseSettings):
 
         return system_info
 
-    def get_gpu_devices(self) -> GPUDevicesInfo:
+    def get_gpu_devices(self) -> GPUDevicesInfo:  # noqa: C901
         """get gpu devices from resources
         resource example:
         ```yaml
@@ -355,9 +356,31 @@ class Config(BaseSettings):
             - name: Apple M1 Pro
               vendor: Apple
               index: 0
+              device_index: 0              # optional
+              device_chip_index: 0         # optional
               memory:
                   total: 22906503168
                   is_unified_memory: true
+        ```
+        ```yaml
+        resources:
+            gpu_devices:
+            - name: Ascend CANN 910b
+              vendor: Huawei
+              index: 0
+              device_index: 0              # optional
+              device_chip_index: 0         # optional
+              memory:
+                  total: 22906503168
+                  is_unified_memory: true
+              network:
+                  status: "up"
+                  inet: "29.17.45.215"
+                  netmask: "255.255.0.0"   # optional
+                  mac: "6c34:91:87:3c:ae"  # optional
+                  gateway: "29.17.0.1"     # optional
+                  iface: "eth4"            # optional
+                  mtu: 8192                # optional
         ```
         """
         gpu_devices: GPUDevicesInfo = []
@@ -371,8 +394,11 @@ class Config(BaseSettings):
         for gd in gpu_device_dict:
             name = gd.get("name")
             index = gd.get("index")
+            device_index = gd.get("device_index", index)
+            device_chip_index = gd.get("device_chip_index", 0)
             vendor = gd.get("vendor")
             memory = gd.get("memory")
+            network = gd.get("network")
             type = gd.get("type") or device_type_from_vendor(vendor)
 
             if not name:
@@ -388,24 +414,55 @@ class Config(BaseSettings):
 
             if not memory:
                 raise Exception("GPU device memory is required")
+            elif not memory.get("total"):
+                raise Exception("GPU device memory total is required")
+
+            if network:
+                network_status = network.get("status", "up")
+                if network_status not in ["up", "down"]:
+                    raise Exception(
+                        "GPU device network status is invalid, supported status are: up, down"
+                    )
+                network_inet = network.get("inet", None)
+                if network_inet is None:
+                    raise Exception("GPU device network inet is required")
+                elif not validators.ip(network_inet):
+                    raise Exception("GPU device network inet is invalid")
+                network_netmask = network.get("netmask", None)
+                if network_netmask and not validators.ip(network_netmask):
+                    raise Exception("GPU device network netmask is invalid")
+                gateway = network.get("gateway", None)
+                if gateway and not validators.ip(gateway):
+                    raise Exception("GPU device network gateway is invalid")
 
             if type not in DeviceTypeEnum.__members__.values():
                 raise Exception(
                     "Unsupported GPU type, supported type are: cuda, musa, npu, mps, rocm, dcu"
                 )
 
-            memory_total = memory.get("total")
-            memory_is_unified_memory = memory.get("is_unified_memory", False)
-            if memory_total is None:
-                raise Exception("GPU device memory total is required")
-
             gpu_devices.append(
                 GPUDeviceInfo(
-                    name=name,
                     index=index,
+                    device_index=device_index,
+                    device_chip_index=device_chip_index,
+                    name=name,
                     vendor=vendor,
                     memory=MemoryInfo(
-                        total=memory_total, is_unified_memory=memory_is_unified_memory
+                        total=memory.get("total"),
+                        is_unified_memory=memory.get("is_unified_memory", False),
+                    ),
+                    network=(
+                        None
+                        if not network
+                        else GPUNetworkInfo(
+                            status=network.get("status", "up"),
+                            inet=network.get("inet"),
+                            netmask=network.get("netmask", ""),
+                            mac=network.get("mac", ""),
+                            gateway=network.get("gateway", ""),
+                            iface=network.get("iface", None),
+                            mtu=network.get("mtu", None),
+                        )
                     ),
                     type=type,
                 )
