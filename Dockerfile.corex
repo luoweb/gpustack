@@ -1,12 +1,4 @@
-ARG UBUNTU_VERSION=22.04
-ARG MUSA_VERSION=rc4.0.1
-ARG BASE_MUSA_DEV_CONTAINER=mthreads/musa:${MUSA_VERSION}-mudnn-devel-ubuntu${UBUNTU_VERSION}
-ARG BASE_MUSA_RUN_CONTAINER=mthreads/musa:${MUSA_VERSION}-mudnn-runtime-ubuntu${UBUNTU_VERSION}
-
-FROM ${BASE_MUSA_DEV_CONTAINER} AS build
-
-ARG TARGETPLATFORM
-ENV DEBIAN_FRONTEND=noninteractive
+FROM crpi-92uj7jb20gffz04j.cn-guangzhou.personal.cr.aliyuncs.com/iluvatar_common/vllm0.8.3-4.2.0:v1 AS build
 
 RUN apt-get update && apt-get install -y \
     git \
@@ -15,7 +7,7 @@ RUN apt-get update && apt-get install -y \
 COPY . /workspace/gpustack
 RUN cd /workspace/gpustack && make build
 
-FROM ${BASE_MUSA_RUN_CONTAINER} AS runtime
+FROM crpi-92uj7jb20gffz04j.cn-guangzhou.personal.cr.aliyuncs.com/iluvatar_common/vllm0.8.3-4.2.0:v1 AS runtime
 
 RUN apt-get update && apt-get install -y \
     python3 \

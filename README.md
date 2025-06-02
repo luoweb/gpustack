@@ -21,7 +21,8 @@
 
 <p align="center">
   <a href="./README.md">English</a> |
-  <a href="./README_CN.md">简体中文</a>
+  <a href="./README_CN.md">简体中文</a> |
+  <a href="./README_JP.md">日本語</a>
 </p>
 
 <br>
@@ -34,7 +35,7 @@ GPUStack is an open-source GPU cluster manager for running AI models.
 
 - **Broad GPU Compatibility:** Seamlessly supports GPUs from various vendors across Apple Macs, Windows PCs, and Linux servers.
 - **Extensive Model Support:** Supports a wide range of models including LLMs, VLMs, image models, audio models, embedding models, and rerank models.
-- **Flexible Inference Backends:** Integrates with llama-box (llama.cpp & stable-diffusion.cpp), vox-box, vLLM, and Ascend MindIE.
+- **Flexible Inference Backends:** Flexibly integrates with multiple inference backends including llama-box (llama.cpp & stable-diffusion.cpp), vox-box, vLLM and Ascend MindIE.
 - **Multi-Version Backend Support:** Run multiple versions of inference backends concurrently to meet the diverse runtime requirements of different models.
 - **Distributed Inference:** Supports single-node and multi-node multi-GPU inference, including heterogeneous GPUs across vendors and runtime environments.
 - **Scalable GPU Architecture:** Easily scale up by adding more GPUs or nodes to your infrastructure.
@@ -154,6 +155,7 @@ curl http://your_gpustack_server_url/v1-openai/chat/completions \
 - [x] Ascend CANN
 - [x] Hygon DTK
 - [x] Moore Threads MUSA
+- [x] Iluvatar Corex
 
 We plan to support the following accelerators in future releases.
 
