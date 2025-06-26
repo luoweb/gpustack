@@ -9,6 +9,7 @@ from typing import List, Optional
 import setproctitle
 
 from gpustack.utils import platform
+from gpustack.utils.command import normalize_parameters
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils.process import add_signal_handlers
 from gpustack.worker.backends.base import get_env_name_by_vendor
@@ -54,7 +55,7 @@ class RPCServer:
         args: Optional[List[str]] = None,
     ):
         command_path = pkg_resources.files(
-            "gpustack.third_party.bin.llama-box"
+            "gpustack.third_party.bin.llama-box.llama-box-default"
         ).joinpath(RPCServer.get_llama_box_rpc_server_command())
 
         arguments = [
@@ -74,6 +75,13 @@ class RPCServer:
         ]
 
         if args:
+            remove_arguments = [
+                "rpc-server-host",
+                "rpc-server-port",
+                "rpc-server-main-gpu",
+                "origin-rpc-server-main-gpu",
+            ]
+            args = normalize_parameters(args, removes=remove_arguments)
             arguments.extend(args)
 
         env_name = get_env_name_by_vendor(vendor)
@@ -90,11 +98,12 @@ class RPCServer:
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 env=env,
+                cwd=command_path.cwd(),
             )
         except Exception as e:
             error_message = f"Failed to run the llama-box rpc server: {e}"
             logger.error(error_message)
-            raise error_message
+            raise Exception(error_message) from e
 
     @staticmethod
     def get_llama_box_rpc_server_command() -> str:

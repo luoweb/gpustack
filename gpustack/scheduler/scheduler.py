@@ -4,29 +4,25 @@ import json
 import logging
 import os
 import queue
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from sqlmodel.ext.asyncio.session import AsyncSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from gpustack.policies.candidate_selectors.vox_box_resource_fit_selector import (
-    VoxBoxResourceFitSelector,
-)
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
 from gpustack.config.config import Config
 from gpustack.policies.base import (
     ModelInstanceScheduleCandidate,
-    ScheduleCandidatesSelector,
     WorkerFilterChain,
 )
-from gpustack.policies.candidate_selectors.gguf_resource_fit_selector import (
+from gpustack.policies.candidate_selectors import (
+    AscendMindIEResourceFitSelector,
     GGUFResourceFitSelector,
+    VLLMResourceFitSelector,
+    VoxBoxResourceFitSelector,
 )
 from gpustack.policies.worker_filters.label_matching_filter import LabelMatchingFilter
 from gpustack.policies.worker_filters.gpu_matching_filter import GPUMatchingFilter
-from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
-    VLLMResourceFitSelector,
-)
 from gpustack.scheduler.model_registry import (
     vllm_supported_embedding_architectures,
     vllm_supported_llm_architectures,
@@ -280,6 +276,13 @@ class Scheduler:
             if model is None:
                 state_message = "Model not found"
 
+            model_instance = await ModelInstance.one_by_id(session, instance.id)
+            if model_instance is None:
+                logger.debug(
+                    f"Model instance(ID: {instance.id}) was deleted before scheduling due"
+                )
+                return
+
             candidate = None
             messages = []
             if workers and model:
@@ -290,7 +293,6 @@ class Scheduler:
                 except Exception as e:
                     state_message = f"Failed to find candidate: {e}"
 
-            model_instance = await ModelInstance.one_by_id(session, instance.id)
             if candidate is None:
                 # update model instance.
                 if model_instance.state in (
@@ -323,6 +325,7 @@ class Scheduler:
                 model_instance.distributed_servers = DistributedServers(
                     rpc_servers=candidate.rpc_servers,
                     ray_actors=candidate.ray_actors,
+                    subordinate_workers=candidate.subordinate_workers,
                 )
 
                 await ModelInstanceService(session).update(model_instance)
@@ -337,10 +340,10 @@ async def find_candidate(
     config: Config,
     model: Model,
     workers: List[Worker],
-) -> Tuple[ModelInstanceScheduleCandidate, List[str]]:
+) -> Tuple[Optional[ModelInstanceScheduleCandidate], List[str]]:
     """
     Find a schedule candidate for the model instance.
-    :param instance: Model instance to schedule.
+    :param config: GPUStack configuration.
     :param model: Model to schedule.
     :param workers: List of workers to consider.
     :return: A tuple containing:
@@ -356,16 +359,19 @@ async def find_candidate(
     worker_filter_chain = WorkerFilterChain(filters)
     workers, messages = await worker_filter_chain.filter(workers)
 
-    candidates_selector: ScheduleCandidatesSelector = None
-    if is_gguf_model(model):
-        candidates_selector = GGUFResourceFitSelector(model, config.cache_dir)
-    elif is_audio_model(model):
-        candidates_selector = VoxBoxResourceFitSelector(config, model, config.cache_dir)
-    else:
-        try:
+    try:
+        if is_gguf_model(model):
+            candidates_selector = GGUFResourceFitSelector(model, config.cache_dir)
+        elif is_audio_model(model):
+            candidates_selector = VoxBoxResourceFitSelector(
+                config, model, config.cache_dir
+            )
+        elif model.backend == BackendEnum.ASCEND_MINDIE:
+            candidates_selector = AscendMindIEResourceFitSelector(config, model)
+        else:
             candidates_selector = VLLMResourceFitSelector(config, model)
-        except Exception as e:
-            return None, [f"VLLM resource fit selector init failed: {e}"]
+    except Exception as e:
+        return None, [f"Failed to initial {model.backend} candidates selector: {e}"]
 
     candidates = await candidates_selector.select_candidates(workers)
 

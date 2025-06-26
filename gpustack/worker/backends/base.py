@@ -32,6 +32,7 @@ ACCELERATOR_VENDOR_TO_ENV_NAME = {
     VendorEnum.AMD: "ROCR_VISIBLE_DEVICES",
     VendorEnum.Hygon: "HIP_VISIBLE_DEVICES",
     VendorEnum.Iluvatar: "CUDA_VISIBLE_DEVICES",
+    VendorEnum.Cambricon: "MLU_VISIBLE_DEVICES",
 }
 
 
@@ -93,7 +94,7 @@ class InferenceServer(ABC):
         if event.data["state"] == ModelInstanceStateEnum.ERROR:
             raise ModelInstanceStateError()
         elif event.data["state"] == ModelInstanceStateEnum.STARTING:
-            self._model_path = event.data["resolved_path"]
+            self._model_path = str(Path(event.data["resolved_path"]).absolute())
             return True
 
         return False

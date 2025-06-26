@@ -72,6 +72,7 @@ class Config(BaseSettings):
         system_reserved: Reserved system resources.
         tools_download_base_url: Base URL to download dependency tools.
         enable_hf_transfer: Speed up file transfers with the huggingface Hub.
+        enable_hf_xet: Using Hugging Face XET for download model files.
         enable_cors: Enable CORS in server.
         allow_origins: A list of origins that should be permitted to make cross-origin requests.
         allow_credentials: Indicate that cookies should be supported for cross-origin requests.
@@ -132,6 +133,7 @@ class Config(BaseSettings):
     tools_download_base_url: Optional[str] = None
     rpc_server_args: Optional[List[str]] = None
     enable_hf_transfer: bool = False
+    enable_hf_xet: bool = False
 
     def __init__(self, **values):
         super().__init__(**values)
@@ -409,7 +411,7 @@ class Config(BaseSettings):
 
             if vendor not in VendorEnum.__members__.values():
                 raise Exception(
-                    "Unsupported GPU device vendor, supported vendors are: Apple, NVIDIA, 'Moore Threads', Huawei, AMD, Hygon, Iluvatar"
+                    "Unsupported GPU device vendor, supported vendors are: Apple, NVIDIA, 'Moore Threads', Huawei, AMD, Hygon, Iluvatar, Cambricon"
                 )
 
             if not memory:
@@ -437,7 +439,7 @@ class Config(BaseSettings):
 
             if type not in DeviceTypeEnum.__members__.values():
                 raise Exception(
-                    "Unsupported GPU type, supported type are: cuda, musa, npu, mps, rocm, dcu, corex"
+                    "Unsupported GPU type, supported type are: cuda, musa, npu, mps, rocm, dcu, corex, mlu"
                 )
 
             gpu_devices.append(
