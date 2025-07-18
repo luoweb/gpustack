@@ -68,10 +68,10 @@
                 },
                 "memory": {
                     "total": 68719476736,
-                    "utilization_rate": 15.0,
+                    "utilization_rate": 5.0,
                     "is_unified_memory": false,
-                    "used": 10307921510,
-                    "allocated": 10307921510
+                    "used": 3435973837,
+                    "allocated": 0
                 },
                 "network": {
                     "status": "up",

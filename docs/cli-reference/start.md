@@ -22,8 +22,7 @@ gpustack start [OPTIONS]
 | `--data-dir` value                  | (empty)                                | Directory to store data. Default is OS specific.                                                                                                                                                                                                                                                      |
 | `--cache-dir` value                 | (empty)                                | Directory to store cache (e.g., model files). Defaults to <data-dir>/cache.                                                                                                                                                                                                                           |
 | `-t` value, `--token` value         | Auto-generated.                        | Shared secret used to add a worker.                                                                                                                                                                                                                                                                   |
-| `--huggingface-token` value         | (empty)                                | User Access Token to authenticate to the Hugging Face Hub. Can also be configured via the `HF_TOKEN` environment variable.                                                                                                                                                                            |
-| `--ollama-library-base-url` value   | `https://registry.ollama.ai`           | Base URL for the Ollama library.                                                                                                                                                                                                                                                                      |
+| `--huggingface-token` value         | (empty)                                | User Access Token to authenticate to the Hugging Face Hub. Can also be configured via the `HF_TOKEN` environment variable.                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `--enable-ray`                      | `False`                                | Enable Ray for running distributed vLLM across multiple workers. Only supported on Linux.                                                                                                                                                                                                             |
 | `--ray-args` value                  | (empty)                                | Arguments to pass to Ray. Use `=` to avoid the CLI recognizing ray-args as a GPUStack argument. This can be used multiple times to pass a list of arguments. Example: `--ray-args=--port=6379 --ray-args=--verbose`. See [Ray docs](https://docs.ray.io/en/latest/cluster/cli.html) for more details. |
 
@@ -67,7 +66,7 @@ gpustack start [OPTIONS]
 | `--ray-object-manager-port` value   | `40099`                                | Port of Ray object manager. Used when Ray is enabled.                                                                                                                                                                                                            |
 | `--ray-worker-port-range` value     | `40100-40131`                          | Port range for Ray worker processes, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive.                                                                                                                                            |
 | `--log-dir` value                   | (empty)                                | Directory to store logs.                                                                                                                                                                                                                                         |
-| `--rpc-server-args` value           | (empty)                                | Arguments to pass to the RPC servers. Use `=` to avoid the CLI recognizing rpc-server-args as a server argument. This can be used multiple times to pass a list of arguments. Example: `--rpc-server-args=--verbose --rpc-server-args=--log-colors --rpc-server-args="rpc-server-cache-dir=/var/lib/gpustack/cache/rpc_server/"`              |
+| `--rpc-server-args` value           | (empty)                                | Arguments to pass to the RPC servers. Use `=` to avoid the CLI recognizing rpc-server-args as a server argument. This can be used multiple times to pass a list of arguments. Example: `--rpc-server-args=--verbose --rpc-server-args=--log-colors --rpc-server-args="rpc-server-cache-dir /var/lib/gpustack/cache/rpc_server/"`              |
 | `--system-reserved` value           | `"{\"ram\": 2, \"vram\": 1}"`          | The system reserves resources for the worker during scheduling, measured in GiB. By default, 2 GiB of RAM and 1G of VRAM is reserved, Note: '{\"memory\": 2, \"gpu_memory\": 1}' is also supported, but it is deprecated and will be removed in future releases. |
 | `--tools-download-base-url` value   |                                        | Base URL for downloading dependency tools.                                                                                                                                                                                                                       |
 | `--enable-hf-transfer`              | `False`                                | Enable faster downloads from the Hugging Face Hub using hf_transfer. https://huggingface.co/docs/huggingface_hub/v0.29.3/package_reference/environment_variables#hfhubenablehftransfer                                                                           |
@@ -82,6 +81,11 @@ Below are additional environment variables that can be set:
 | ----------------------------------- | -------------------------------------------------------- |
 | `HF_ENDPOINT`                       | Hugging Face Hub endpoint. e.g., `https://hf-mirror.com` |
 
+Below are prefixed with `GPUSTACK_` special environment variables that can be set:
+| <div style="width:360px">Flag</div>        | Description                                              |
+| -----------------------------------        | -------------------------------------------------------- |
+| `GPUSTACK_DISABLE_DYNAMIC_LINK_LLAMA_BOX`  | Dynamic linking is used by default. Setting this to `true` enables static linking. |
+
 ## Config File
 
 You can configure start options using a YAML-format config file when starting GPUStack server or worker. Here is a complete example:
@@ -92,7 +96,6 @@ debug: false
 data_dir: /path/to/data_dir
 cache_dir: /path/to/cache_dir
 token: mytoken
-ollama_library_base_url: https://registry.mycompany.com
 enable_ray: false
 ray_args: ["--port=6379", "--verbose"]
 

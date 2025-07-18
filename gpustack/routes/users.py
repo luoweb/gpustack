@@ -7,7 +7,7 @@ from gpustack.api.exceptions import (
     NotFoundException,
 )
 from gpustack.security import get_secret_hash
-from gpustack.server.deps import CurrentUserDep, ListParamsDep, SessionDep
+from gpustack.server.deps import CurrentUserDep, ListParamsDep, SessionDep, EngineDep
 from gpustack.schemas.users import User, UserCreate, UserUpdate, UserPublic, UsersPublic
 from gpustack.server.services import UserService
 
@@ -15,14 +15,16 @@ router = APIRouter()
 
 
 @router.get("", response_model=UsersPublic)
-async def get_users(session: SessionDep, params: ListParamsDep, search: str = None):
+async def get_users(
+    engine: EngineDep, session: SessionDep, params: ListParamsDep, search: str = None
+):
     fuzzy_fields = {}
     if search:
         fuzzy_fields = {"username": search, "full_name": search}
 
     if params.watch:
         return StreamingResponse(
-            User.streaming(session, fuzzy_fields=fuzzy_fields),
+            User.streaming(engine, fuzzy_fields=fuzzy_fields),
             media_type="text/event-stream",
         )
 
@@ -46,7 +48,7 @@ async def get_user(session: SessionDep, id: int):
 async def create_user(session: SessionDep, user_in: UserCreate):
     existing = await User.one_by_field(session, "username", user_in.username)
     if existing:
-        raise AlreadyExistsException(message=f"User f{user_in.username} already exists")
+        raise AlreadyExistsException(message=f"User {user_in.username} already exists")
 
     try:
         to_create = User(
@@ -113,7 +115,7 @@ async def update_user_me(
             hashed_password = get_secret_hash(update_data["password"])
             update_data["hashed_password"] = hashed_password
             del update_data["password"]
-        await user.update(session, update_data)
+        await UserService(session).update(user, update_data)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update user: {e}")
 

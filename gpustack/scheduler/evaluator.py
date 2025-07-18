@@ -28,6 +28,7 @@ from gpustack.schemas.models import (
     is_audio_model,
     is_gguf_model,
 )
+from gpustack.utils.gpu import any_gpu_match
 from gpustack.utils.hub import (
     auth_check,
     get_hugging_face_model_min_gguf_path,
@@ -186,18 +187,11 @@ def summarize_candidate_resource_claim(
     """
     computed_resource_claims = [candidate.computed_resource_claim]
 
-    if candidate.rpc_servers:
+    if candidate.subordinate_workers:
         computed_resource_claims.extend(
-            rpc.computed_resource_claim
-            for rpc in candidate.rpc_servers
-            if rpc.computed_resource_claim is not None
-        )
-
-    if candidate.ray_actors:
-        computed_resource_claims.extend(
-            actor.computed_resource_claim
-            for actor in candidate.ray_actors
-            if actor.computed_resource_claim is not None
+            sw.computed_resource_claim
+            for sw in candidate.subordinate_workers
+            if sw.computed_resource_claim is not None
         )
 
     ram, vram = 0, 0
@@ -256,34 +250,14 @@ async def evaluate_environment(
     ):
         return False, ["The model is not supported on Windows workers."]
 
-    if backend == BackendEnum.ASCEND_MINDIE and not has_ascend_npu(workers):
+    if backend == BackendEnum.ASCEND_MINDIE and not any_gpu_match(
+        workers, lambda gpu: gpu.vendor == VendorEnum.Huawei.value
+    ):
         return False, [
             "The Ascend MindIE backend requires Ascend NPUs but none are available."
         ]
 
     return True, []
-
-
-def has_ascend_npu(workers: List[Worker]) -> bool:
-    for worker in workers:
-        if worker.status and worker.status.gpu_devices:
-            for gpu in worker.status.gpu_devices:
-                if gpu.vendor == VendorEnum.Huawei.value:
-                    return True
-    return False
-
-
-def only_ascend_npu(workers: List[Worker]) -> bool:
-    has_ascend_npu = False
-    has_other_gpu = False
-    for worker in workers:
-        if worker.status and worker.status.gpu_devices:
-            for gpu in worker.status.gpu_devices:
-                if gpu.vendor == VendorEnum.Huawei.value:
-                    has_ascend_npu = True
-                else:
-                    has_other_gpu = True
-    return has_ascend_npu and not has_other_gpu
 
 
 async def evaluate_model_metadata(
@@ -360,12 +334,19 @@ def set_default_spec(model: ModelSpec) -> bool:
 
     modified = False
     if model_spec_in_catalog:
-        if model_spec_in_catalog.backend_parameters and not model.backend_parameters:
+        if (
+            model_spec_in_catalog.backend_parameters
+            and model.backend_parameters is None
+        ):
             model.backend_parameters = model_spec_in_catalog.backend_parameters
             modified = True
 
-        if model_spec_in_catalog.env and not model.env:
+        if model_spec_in_catalog.env and model.env is None:
             model.env = model_spec_in_catalog.env
+            modified = True
+
+        if model_spec_in_catalog.categories and not model.categories:
+            model.categories = model_spec_in_catalog.categories
             modified = True
 
     return modified

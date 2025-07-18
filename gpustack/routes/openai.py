@@ -1,6 +1,5 @@
 import asyncio
-import os
-from typing import List, Optional
+from typing import AsyncGenerator, List, Optional, Tuple
 import aiohttp
 import logging
 
@@ -21,13 +20,14 @@ from gpustack.api.exceptions import (
     GatewayTimeoutException,
 )
 from gpustack.api.responses import StreamingResponseWithStatusCode
+from gpustack.config.envs import PROXY_TIMEOUT
 from gpustack.http_proxy.load_balancer import LoadBalancer
 from gpustack.routes.models import build_category_conditions
 from gpustack.schemas.models import (
     CategoryEnum,
     Model,
 )
-from gpustack.server.db import get_session_context
+from gpustack.server.db import get_engine
 from gpustack.server.deps import SessionDep
 from gpustack.server.services import ModelInstanceService, ModelService, WorkerService
 
@@ -38,8 +38,6 @@ load_balancer = LoadBalancer()
 
 
 aliasable_router = APIRouter()
-
-PROXY_TIMEOUT = int(os.getenv("GPUSTACK_PROXY_TIMEOUT_SECONDS", 1800))
 
 
 @aliasable_router.post("/chat/completions")
@@ -157,10 +155,8 @@ async def proxy_request_by_model(request: Request, endpoint: str):
     Proxy the request to the model instance that is running the model specified in the
     request body.
     """
-    async with get_session_context() as session:
-        model, stream, body_json, form_data, form_files = await parse_request_body(
-            request, session
-        )
+    async with AsyncSession(get_engine()) as session:
+        model, stream, body_json, form_data = await parse_request_body(request, session)
 
         if not model:
             raise NotFoundException(
@@ -171,6 +167,8 @@ async def proxy_request_by_model(request: Request, endpoint: str):
         request.state.model = model
         request.state.stream = stream
 
+        mutate_request(request, body_json, form_data)
+
         instance = await get_running_instance(session, model.id)
         worker = await WorkerService(session).get_by_id(instance.worker_id)
         if not worker:
@@ -179,24 +177,15 @@ async def proxy_request_by_model(request: Request, endpoint: str):
                 is_openai_exception=True,
             )
 
-    url = f"http://{instance.worker_ip}:{worker.port}/proxy/v1/{endpoint}"
-    token = request.app.state.server_config.token
-    extra_headers = {
-        "X-Target-Port": str(instance.port),
-        "Authorization": f"Bearer {token}",
-    }
+    url = f"http://{instance.worker_ip}:{instance.port}/v1/{endpoint}"
 
     logger.debug(f"proxying to {url}, instance port: {instance.port}")
 
     try:
         if stream:
-            return await handle_streaming_request(
-                request, url, body_json, form_data, form_files, extra_headers
-            )
+            return await handle_streaming_request(request, url, body_json, form_data)
         else:
-            return await handle_standard_request(
-                request, url, body_json, form_data, form_files, extra_headers
-            )
+            return await handle_standard_request(request, url, body_json, form_data)
     except asyncio.TimeoutError as e:
         error_message = f"Request to {url} timed out"
         if str(e):
@@ -220,13 +209,12 @@ async def parse_request_body(request: Request, session: SessionDep):
     stream = False
     body_json = None
     form_data = None
-    form_files = None
     content_type = request.headers.get("content-type", "application/json").lower()
 
     if request.method == "GET":
         model_name = request.query_params.get("model")
     elif content_type.startswith("multipart/form-data"):
-        form_data, form_files, model_name = await parse_form_data(request)
+        form_data, model_name, stream = await parse_form_data(request)
     else:
         body_json, model_name, stream = await parse_json_body(request)
 
@@ -236,30 +224,29 @@ async def parse_request_body(request: Request, session: SessionDep):
             is_openai_exception=True,
         )
 
-    if form_data and form_data.get("stream", False):
-        # stream may be set in form data, e.g., image edits.
-        stream = True
-
     model = await ModelService(session).get_by_name(model_name)
-    return model, stream, body_json, form_data, form_files
+    return model, stream, body_json, form_data
 
 
-async def parse_form_data(request: Request):
+async def parse_form_data(request: Request) -> Tuple[aiohttp.FormData, str, bool]:
     try:
         form = await request.form()
         model_name = form.get("model")
+        stream = form.get("stream", False)
 
-        form_files = []
-        form_data = {}
+        form_data = aiohttp.FormData()
         for key, value in form.items():
             if isinstance(value, UploadFile):
-                form_files.append(
-                    (key, (value.filename, await value.read(), value.content_type))
+                form_data.add_field(
+                    key,
+                    await value.read(),
+                    filename=value.filename,
+                    content_type=value.content_type,
                 )
             else:
-                form_data[key] = value
+                form_data.add_field(key, value)
 
-        return form_data, form_files, model_name
+        return form_data, model_name, stream
     except Exception as e:
         raise BadRequestException(
             message=f"We could not parse the form body of your request: {e}",
@@ -280,12 +267,37 @@ async def parse_json_body(request: Request):
         )
 
 
+async def _stream_response_chunks(
+    resp: aiohttp.ClientResponse,
+) -> AsyncGenerator[str, None]:
+    """Stream the response content in chunks, processing each line."""
+
+    chunk_size = 4096  # 4KB
+    chunk_buffer = b""
+    async for data in resp.content.iter_chunked(chunk_size):
+        lines = (chunk_buffer + data).split(b'\n')
+        # Keep the last line in the buffer if it's incomplete
+        chunk_buffer = lines.pop(-1)
+
+        for line_bytes in lines:
+            if line_bytes:
+                yield _process_line(line_bytes)
+
+    if chunk_buffer:
+        yield _process_line(chunk_buffer)
+
+
+def _process_line(line_bytes: bytes) -> str:
+    """Process a line of bytes to ensure it is properly formatted for streaming."""
+    line = line_bytes.decode("utf-8").strip()
+    return line + "\n\n" if line else ""
+
+
 async def handle_streaming_request(
     request: Request,
     url: str,
     body_json: Optional[dict],
-    form_data: Optional[dict],
-    form_files: Optional[list],
+    form_data: Optional[aiohttp.FormData],
     extra_headers: Optional[dict] = None,
 ):
     timeout = aiohttp.ClientTimeout(total=300)
@@ -306,21 +318,15 @@ async def handle_streaming_request(
                 url=url,
                 headers=headers,
                 json=body_json if body_json else None,
-                data=form_data if form_data else None,
+                data=form_data,
                 timeout=timeout,
             ) as resp:
                 if resp.status >= 400:
                     yield await resp.read(), resp.headers, resp.status
                     return
 
-                chunk = ""
-                async for line in resp.content:
-                    line = line.decode("utf-8").strip()
-                    if line != "":
-                        chunk = line + "\n"
-                    else:
-                        chunk += "\n"
-                        yield chunk, resp.headers, resp.status
+                async for chunk in _stream_response_chunks(resp):
+                    yield chunk, resp.headers, resp.status
         except aiohttp.ClientError as e:
             error_response = OpenAIAPIErrorResponse(
                 error=OpenAIAPIError(
@@ -349,21 +355,12 @@ async def handle_standard_request(
     request: Request,
     url: str,
     body_json: Optional[dict],
-    form_data: Optional[dict],
-    form_files: Optional[list],
+    form_data: Optional[aiohttp.FormData],
     extra_headers: Optional[dict] = None,
 ):
     headers = filter_headers(request.headers)
     if extra_headers:
         headers.update(extra_headers)
-    data = None
-    if form_data or form_files:
-        form = aiohttp.FormData()
-        for key, value in (form_data or {}).items():
-            form.add_field(key, value)
-        for key, (filename, content, content_type) in form_files or []:
-            form.add_field(key, content, filename=filename, content_type=content_type)
-        data = form
 
     http_client: aiohttp.ClientSession = request.app.state.http_client
     timeout = aiohttp.ClientTimeout(total=PROXY_TIMEOUT)
@@ -372,7 +369,7 @@ async def handle_standard_request(
         url=url,
         headers=headers,
         json=body_json if body_json else None,
-        data=data if data else None,
+        data=form_data,
         timeout=timeout,
     ) as response:
         content = await response.read()
@@ -405,3 +402,37 @@ async def get_running_instance(session: AsyncSession, model_id: int):
             is_openai_exception=True,
         )
     return await load_balancer.get_instance(running_instances)
+
+
+def mutate_request(
+    request: Request, body_json: Optional[dict], form_data: Optional[aiohttp.FormData]
+):
+    path = request.url.path
+    model: Model = request.state.model
+    if (
+        path == "/v1/rerank"
+        and body_json
+        and model.env
+        and model.env.get("GPUSTACK_APPLY_QWEN3_RERANKER_TEMPLATES", False)
+    ):
+        apply_qwen3_reranker_templates(body_json)
+
+
+def apply_qwen3_reranker_templates(body_json: dict):
+    """
+    Apply Qwen3 reranker templates to the request body.
+    See instructions in https://huggingface.co/Qwen/Qwen3-Reranker-0.6B.
+    Note: Once vLLM supports built-in template rendering for this model, this can be removed.
+    """
+    prefix = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
+    suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    query_template = "{prefix}<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n<Query>: {query}\n"
+    document_template = "<Document>: {doc}{suffix}"
+    if "query" in body_json and "documents" in body_json:
+        query = body_json["query"]
+        documents = body_json["documents"]
+        body_json["query"] = query_template.format(prefix=prefix, query=query)
+        body_json["documents"] = [
+            document_template.format(doc=doc, suffix=suffix) for doc in documents
+        ]

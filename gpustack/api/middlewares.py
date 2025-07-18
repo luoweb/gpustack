@@ -3,21 +3,21 @@ import json
 import logging
 import time
 from typing import Type, Union
-from fastapi import Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Request, Response, status
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from jwt import DecodeError, ExpiredSignatureError
 from starlette.middleware.base import BaseHTTPMiddleware
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
-from openai.types import Completion, CompletionUsage
-from openai.types.images_response import ImagesResponse
+from openai.types import CompletionUsage
 from openai.types.audio.transcription_create_response import (
     Transcription,
 )
 from openai.types.create_embedding_response import (
     Usage as EmbeddingUsage,
 )
+from gpustack.api.exceptions import ErrorResponse
 from gpustack.routes.rerank import RerankResponse, RerankUsage
-from gpustack.schemas.images import ImageGenerationChunk
+from gpustack.schemas.images import ImageGenerationChunk, ImagesResponse
 from gpustack.schemas.model_usage import ModelUsage, OperationEnum
 from gpustack.schemas.models import Model
 from gpustack.schemas.users import User
@@ -27,7 +27,7 @@ from gpustack.server.db import get_engine
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.server.services import ModelUsageService
-from gpustack.api.types.openai_ext import CreateEmbeddingResponseExt
+from gpustack.api.types.openai_ext import CreateEmbeddingResponseExt, CompletionExt
 
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,17 @@ logger = logging.getLogger(__name__)
 class RequestTimeMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request.state.start_time = datetime.now(timezone.utc)
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            response = JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content=ErrorResponse(
+                    code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    reason="Internal Server Error",
+                    message=f"Unexpected error occurred: {e}",
+                ).model_dump(),
+            )
         return response
 
 
@@ -51,7 +61,7 @@ class ModelUsageMiddleware(BaseHTTPMiddleware):
                 )
             elif path == "/v1-openai/completions" or path == "/v1/completions":
                 return await process_request(
-                    request, response, Completion, OperationEnum.COMPLETION
+                    request, response, CompletionExt, OperationEnum.COMPLETION
                 )
             elif path == "/v1-openai/embeddings" or path == "/v1/embeddings":
                 return await process_request(
@@ -63,6 +73,8 @@ class ModelUsageMiddleware(BaseHTTPMiddleware):
             elif (
                 path == "/v1-openai/images/generations"
                 or path == "/v1/images/generations"
+                or path == "/v1-openai/images/edits"
+                or path == "/v1/images/edits"
             ):
                 return await process_request(
                     request,
@@ -104,7 +116,7 @@ async def process_request(
     response_class: Type[
         Union[
             ChatCompletion,
-            Completion,
+            CompletionExt,
             CreateEmbeddingResponseExt,
             RerankResponse,
             ImagesResponse,
@@ -185,7 +197,9 @@ async def record_model_usage(
 async def handle_streaming_response(
     request: Request,
     response: StreamingResponse,
-    response_class: Type[Union[ChatCompletionChunk, Completion, ImageGenerationChunk]],
+    response_class: Type[
+        Union[ChatCompletionChunk, CompletionExt, ImageGenerationChunk]
+    ],
     operation: OperationEnum,
 ):
     async def streaming_generator():
@@ -309,7 +323,7 @@ class RefreshTokenMiddleware(BaseHTTPMiddleware):
 
 
 def is_usage_chunk(
-    chunk: Union[ChatCompletionChunk, Completion, ImageGenerationChunk],
+    chunk: Union[ChatCompletionChunk, CompletionExt, ImageGenerationChunk],
 ) -> bool:
     choices = getattr(chunk, "choices", None)
 

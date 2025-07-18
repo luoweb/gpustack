@@ -17,14 +17,12 @@ from gpustack.schemas.models import BackendEnum
 from gpustack.utils.command import get_versioned_command
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils import platform, envs
-from gpustack.utils.platform import get_executable_suffix as exe
 
 logger = logging.getLogger(__name__)
 
 
-BUILTIN_LLAMA_BOX_VERSION = "v0.0.157"
-BUILTIN_GGUF_PARSER_VERSION = "v0.19.0"
-BUILTIN_RAY_VERSION = "2.43.0"
+BUILTIN_LLAMA_BOX_VERSION = "v0.0.164"
+BUILTIN_GGUF_PARSER_VERSION = "v0.21.1"
 
 
 class ToolsManager:
@@ -39,6 +37,7 @@ class ToolsManager:
     def __init__(
         self,
         tools_download_base_url: str = None,
+        data_dir: Optional[str] = None,
         bin_dir: Optional[str] = None,
         pipx_path: Optional[str] = None,
         device: Optional[str] = None,
@@ -61,6 +60,7 @@ class ToolsManager:
         self._arch = arch if arch else platform.arch()
         self._device = device if device else platform.device()
         self._download_base_url = tools_download_base_url
+        self._data_dir = data_dir
         self._bin_dir = bin_dir
         self._pipx_path = pipx_path
 
@@ -173,26 +173,42 @@ class ToolsManager:
 
     def download_llama_box(self):
         version = BUILTIN_LLAMA_BOX_VERSION
-        target_dir = (
-            self.third_party_bin_path
-            / "llama-box"
-            / get_llama_box_version_dir_name(version)
+        disabled_dynamic_link = (
+            is_disabled_dynamic_link(version) and self._bin_dir is not None
         )
-        target_file = get_llama_box_command(target_dir)
-        file_name = os.path.basename(target_file)
+        if disabled_dynamic_link:
+            target_dir = (
+                Path(self._bin_dir) / 'llama-box' / 'static' / f'llama-box-{version}'
+            )
+        else:
+            target_dir = (
+                self.third_party_bin_path
+                / "llama-box"
+                / get_llama_box_version_dir_name(version)
+            )
+
+        file_name = "llama-box.exe" if self._os == "windows" else "llama-box"
+        target_file = target_dir / file_name
+        version_key = target_file.parent.name
 
         if (
             target_file.is_file()
-            and self._current_tools_version.get(file_name) == version
+            and self._current_tools_version.get(version_key) == version
         ):
             logger.debug(f"{file_name} already exists, skipping download")
         else:
-            self._download_llama_box(version, target_dir, file_name)
+            self._download_llama_box(
+                version,
+                target_dir,
+                file_name,
+                disabled_dynamic_link,
+            )
             # Update versions.json
-            self._update_versions_file(file_name, version)
+            self._update_versions_file(version_key, version)
 
         self._link_llama_box_rpc_server(target_dir, file_name)
-        self._link_llama_box_default_dir(version)
+        if not disabled_dynamic_link:
+            self._link_llama_box_default_dir(version)
 
     def install_versioned_ascend_mindie(self, version: str):
         if self._os != "linux":
@@ -240,7 +256,14 @@ class ToolsManager:
         self._download_acsend_mindie(version, target_dir)
 
     def install_versioned_llama_box(self, version: str):
-        target_dir = Path(self._bin_dir) / "llama-box" / f"llama-box-{version}"
+        # Install the package to <bin_dir>/llama-box/llama-box-{version},
+        # if allowing dynamic linking binary,
+        # otherwise to <bin_dir>/llama-box/static/llama-box-{version}.
+        disabled_dynamic_link = is_disabled_dynamic_link(version)
+        target_dir = Path(self._bin_dir) / "llama-box"
+        if disabled_dynamic_link:
+            target_dir = target_dir / "static"
+        target_dir = target_dir / f"llama-box-{version}"
         target_file = get_llama_box_command(target_dir)
         file_name = os.path.basename(target_file)
 
@@ -248,35 +271,31 @@ class ToolsManager:
             logger.debug(f"{file_name} already exists, skipping download")
             return
 
-        self._download_llama_box(version, target_dir, file_name)
+        self._download_llama_box(version, target_dir, file_name, disabled_dynamic_link)
 
     def install_versioned_vllm(self, version: str):
         system = platform.system()
         arch = platform.arch()
         device = platform.device()
+        target_path = Path(self._bin_dir) / get_versioned_command("vllm", version)
 
         if system != "linux" or arch != "amd64":
-            target_path = Path(self._bin_dir) / get_versioned_command("vllm", version)
-            raise Exception(
-                f"Auto-installation for versioned vLLM is only supported on amd64 Linux. Please install vLLM manually and link it to {target_path}."
-            )
+            if not target_path.exists():
+                raise Exception(
+                    f"Auto-installation for versioned vLLM is only supported on amd64 Linux. Please install vLLM manually and link it to {target_path}."
+                )
         elif device != platform.DeviceTypeEnum.CUDA.value:
-            raise Exception(
-                f"Auto-installation for versioned vLLM is only supported on CUDA devices. Please install vLLM manually and link it to {target_path}."
-            )
+            if not target_path.exists():
+                raise Exception(
+                    f"Auto-installation for versioned vLLM is only supported on CUDA devices. Please install vLLM manually and link it to {target_path}."
+                )
 
         self.install_versioned_package_by_pipx(
             "vllm",
             version,
-            extra_packages=[
-                "gpustack",  # To apply Ray patch for dist vLLM
-                f"ray=={BUILTIN_RAY_VERSION}",  # To avoid version conflict with Ray cluster
-            ],
         )
 
-    def install_versioned_package_by_pipx(
-        self, package: str, version: str, extra_packages: Optional[list] = None
-    ):
+    def install_versioned_package_by_pipx(self, package: str, version: str):
         """
         Install a versioned package using pipx.
 
@@ -287,6 +306,9 @@ class ToolsManager:
         if target_path.exists():
             logger.debug(f"{package} {version} already exists, skipping installation")
             return
+        elif os.path.lexists(target_path):
+            # In case of a broken symlink, remove it.
+            target_path.unlink()
 
         pipx_path = shutil.which("pipx")
         if self._pipx_path:
@@ -297,12 +319,6 @@ class ToolsManager:
                 f"pipx is required to install versioned {package} but not found in system PATH. "
                 "Please install pipx first or provide the path to pipx using the server option `--pipx-path`. "
                 f"Alternatively, you can install {package} manually and link it to {target_path}."
-            )
-
-        pipx_bin_path = self._get_pipx_bin_dir(pipx_path)
-        if not pipx_bin_path:
-            raise Exception(
-                "Failed to determine pipx binary directory. Ensure pipx is correctly installed."
             )
 
         suffix = f"_{version}"
@@ -316,47 +332,24 @@ class ToolsManager:
             f"{package}=={version}",
         ]
 
+        env = os.environ.copy()
+        if self._data_dir and self._bin_dir:
+            env["PIPX_HOME"] = str(Path(self._data_dir) / "pipx")
+            env["PIPX_BIN_DIR"] = self._bin_dir
+        else:
+            raise Exception(
+                "Both data_dir and bin_dir must be set to install versioned packages using pipx."
+            )
+
         try:
             logger.info(f"Installing {package} {version} using pipx")
-            subprocess.run(install_command, check=True, text=True)
-
-            installed_bin_path = pipx_bin_path / f"{package}{suffix}"
-            if not installed_bin_path.exists():
-                raise Exception(
-                    f"Installation succeeded, but executable not found at {installed_bin_path}"
-                )
-
-            # Create a symlink to the installed binary
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.symlink_to(installed_bin_path)
-
-            if extra_packages:
-                for extra_package in extra_packages:
-                    self._pipx_inject_package(
-                        pipx_path, f"{package}{suffix}", extra_package
-                    )
+            subprocess.run(install_command, env=env, check=True, text=True)
 
             logger.info(
                 f"{package} {version} successfully installed and linked to {target_path}"
             )
         except Exception as e:
             raise Exception(f"Failed to install {package} {version} using pipx: {e}")
-
-    def _pipx_inject_package(self, pipx_path: str, env_name: str, package: str):
-        """
-        Use `pipx inject` to add a package to an existing pipx environment.
-        """
-        try:
-            logger.info(f"Injecting {package} into pipx environment '{env_name}'")
-            subprocess.run(
-                [pipx_path, "inject", env_name, package, "--force"],
-                check=True,
-                text=True,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to inject {package} into pipx environment '{env_name}': {e}"
-            )
 
     def _get_pipx_bin_dir(self, pipx_path: str) -> Path:
         """
@@ -440,7 +433,11 @@ class ToolsManager:
             shutil.rmtree(tmp_dir)
 
     def _download_llama_box(
-        self, version: str, target_dir: Path, target_file_name: str
+        self,
+        version: str,
+        target_dir: Path,
+        target_file_name: str,
+        disabled_dynamic_link: bool,
     ):
         llama_box_tmp_dir = target_dir.joinpath("tmp-llama-box")
 
@@ -449,9 +446,9 @@ class ToolsManager:
             shutil.rmtree(llama_box_tmp_dir)
         os.makedirs(llama_box_tmp_dir, exist_ok=True)
 
-        # Since v0.0.157: Use dynamic libraries instead of static linking
         platform_name = self._get_llama_box_platform_name(
-            version, version >= "v0.0.157"
+            version,
+            disabled_dynamic_link,
         )
         tmp_file = llama_box_tmp_dir / f"llama-box-{version}-{platform_name}.zip"
         url_path = f"gpustack/llama-box/releases/download/{version}/{platform_name}.zip"
@@ -459,7 +456,6 @@ class ToolsManager:
         self._download_file(url_path, tmp_file)
         self._extract_file(tmp_file, llama_box_tmp_dir)
 
-        file_name = "llama-box.exe" if self._os == "windows" else "llama-box"
         target_file = target_dir / target_file_name
 
         def ignore_zip_files(_, names):
@@ -468,7 +464,6 @@ class ToolsManager:
         shutil.copytree(
             llama_box_tmp_dir, target_dir, dirs_exist_ok=True, ignore=ignore_zip_files
         )
-        shutil.copy(llama_box_tmp_dir / file_name, target_file)
         # Make the file executable (non-Windows only)
         if self._os != "windows":
             st = os.stat(target_file)
@@ -545,7 +540,7 @@ class ToolsManager:
         logger.debug(f"Linked from {src_dir} to {dst_dir}")
 
     def _get_llama_box_platform_name(  # noqa C901
-        self, version: str, enable_dynmaic_link: bool
+        self, version: str, disabled_dynamic_link: bool
     ) -> str:
         """
         Get the platform name for llama-box based on the OS, architecture, and device type.
@@ -563,9 +558,9 @@ class ToolsManager:
         if self._device in device_toolkit_mapper:
             toolkit = device_toolkit_mapper[self._device]
         elif self._arch == "amd64":
-            toolkit = "cpu" if enable_dynmaic_link else "avx2"
+            toolkit = "avx2" if disabled_dynamic_link else "cpu"
         elif self._arch == "arm64":
-            toolkit = "cpu" if enable_dynmaic_link else "neon"
+            toolkit = "neon" if disabled_dynamic_link else "cpu"
         else:
             raise Exception(
                 f"unsupported platform, os: {self._os}, arch: {self._arch}, device: {self._device}"
@@ -631,9 +626,9 @@ class ToolsManager:
             segments.append(toolkit_version)
 
         return (
-            f"dl-llama-box-{'-'.join(segments)}"
-            if enable_dynmaic_link
-            else f"llama-box-{'-'.join(segments)}"
+            f"llama-box-{'-'.join(segments)}"
+            if disabled_dynamic_link
+            else f"dl-llama-box-{'-'.join(segments)}"
         )
 
     def download_gguf_parser(self):
@@ -657,7 +652,7 @@ class ToolsManager:
         platform_name = self._get_gguf_parser_platform_name()
         url_path = f"gpustack/gguf-parser-go/releases/download/{version}/gguf-parser-{platform_name}{suffix}"
 
-        logger.info(f"downloading gguf-parser-{platform_name} '{version}'")
+        logger.info(f"Downloading gguf-parser-{platform_name} '{version}'")
         self._download_file(url_path, target_file)
 
         if self._os != "windows":
@@ -702,7 +697,7 @@ class ToolsManager:
             logger.debug(f"{file_name} already exists, skipping download")
             return
 
-        logger.info(f"downloading fastfetch-{platform_name} '{version}'")
+        logger.info(f"Downloading fastfetch-{platform_name} '{version}'")
 
         tmp_file = os.path.join(fastfetch_tmp_dir, f"fastfetch-{platform_name}.zip")
         if os.path.exists(fastfetch_tmp_dir):
@@ -947,18 +942,12 @@ def get_llama_box_command(
         Path,
     ],
 ) -> Path:
-    system = platform.system()
-    arch = platform.arch()
-    device = platform.device()
-    device = f'-{device}' if device else ''
-    full_path = os.path.join(base_path, f"llama-box-{system}-{arch}{device}{exe()}")
-    default_path = os.path.join(base_path, f"llama-box{exe()}")
-    # If both full_path and default_path do not exist, return full_path.
-    if not os.path.exists(full_path) and not os.path.exists(default_path):
-        command_path = full_path
-    else:
-        command_path = full_path if os.path.exists(full_path) else default_path
-    return Path(command_path)
+    command = "llama-box"
+    if platform.system() == "windows":
+        command += ".exe"
+    if isinstance(base_path, str):
+        base_path = Path(base_path)
+    return base_path.joinpath(command)
 
 
 def get_llama_box_version_dir_name(
@@ -970,3 +959,14 @@ def get_llama_box_version_dir_name(
     device = f'-{device}' if device else ''
     dir_name = os.path.join(f"llama-box-{version}-{system}-{arch}{device}")
     return dir_name
+
+
+def is_disabled_dynamic_link(version: Optional[str]) -> Optional[bool]:
+    if version is None:
+        version = BUILTIN_LLAMA_BOX_VERSION
+
+    # Support dynamic linking for llama-box after v0.0.157.
+    if version < "v0.0.157":
+        return True
+
+    return envs.get_gpustack_env_bool("DISABLE_DYNAMIC_LINK_LLAMA_BOX")

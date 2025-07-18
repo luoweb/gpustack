@@ -21,6 +21,7 @@ from gpustack.policies.candidate_selectors import (
     VLLMResourceFitSelector,
     VoxBoxResourceFitSelector,
 )
+from gpustack.policies.utils import ListMessageBuilder
 from gpustack.policies.worker_filters.label_matching_filter import LabelMatchingFilter
 from gpustack.policies.worker_filters.gpu_matching_filter import GPUMatchingFilter
 from gpustack.scheduler.model_registry import (
@@ -42,6 +43,7 @@ from gpustack.schemas.models import (
     get_backend,
     is_gguf_model,
     is_audio_model,
+    DistributedServerCoordinateModeEnum,
 )
 from gpustack.server.bus import EventType
 from gpustack.server.db import get_engine
@@ -257,7 +259,7 @@ class Scheduler:
             except Exception as e:
                 logger.error(f"Failed to get item from schedule queue: {e}")
 
-    async def _schedule_one(self, instance: ModelInstance):
+    async def _schedule_one(self, instance: ModelInstance):  # noqa: C901
         """
         Schedule a model instance by picking one candidate.
         Args:
@@ -301,8 +303,7 @@ class Scheduler:
                 ):
                     model_instance.state = ModelInstanceStateEnum.PENDING
                     model_instance.state_message = (
-                        "No suitable workers.\n"
-                        "Details:\n" + "\n".join(f"- {msg}" for msg in messages)
+                        "No suitable workers.\nDetails:\n" + "".join(messages)
                     )
                 if state_message != "":
                     model_instance.state_message = state_message
@@ -322,11 +323,14 @@ class Scheduler:
                     candidate.computed_resource_claim
                 )
                 model_instance.gpu_indexes = candidate.gpu_indexes
+                model_instance.gpu_addresses = candidate.gpu_addresses
                 model_instance.distributed_servers = DistributedServers(
-                    rpc_servers=candidate.rpc_servers,
-                    ray_actors=candidate.ray_actors,
                     subordinate_workers=candidate.subordinate_workers,
                 )
+                if get_backend(model) == BackendEnum.ASCEND_MINDIE:
+                    model_instance.distributed_servers.mode = (
+                        DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+                    )
 
                 await ModelInstanceService(session).update(model_instance)
 
@@ -357,7 +361,8 @@ async def find_candidate(
     ]
 
     worker_filter_chain = WorkerFilterChain(filters)
-    workers, messages = await worker_filter_chain.filter(workers)
+    workers, filter_messages = await worker_filter_chain.filter(workers)
+    messages = [str(ListMessageBuilder(filter_messages))]
 
     try:
         if is_gguf_model(model):
@@ -371,7 +376,7 @@ async def find_candidate(
         else:
             candidates_selector = VLLMResourceFitSelector(config, model)
     except Exception as e:
-        return None, [f"Failed to initial {model.backend} candidates selector: {e}"]
+        return None, [f"Failed to initialize {model.backend} candidates selector: {e}"]
 
     candidates = await candidates_selector.select_candidates(workers)
 
@@ -421,6 +426,11 @@ async def evaluate_gguf_model(
         cache_dir=config.cache_dir,
         ollama_library_base_url=config.ollama_library_base_url,
     )
+    if (
+        task_output.resource_architecture
+        and not task_output.resource_architecture.is_deployable()
+    ):
+        raise ValueError("Not a supported model.")
 
     should_update = False
     if task_output.resource_claim_estimate.reranking and not model.categories:
@@ -602,12 +612,9 @@ def simplify_auto_config_value_error(e: ValueError) -> ValueError:
     Simplify the error message for ValueError exceptions.
     """
     message = str(e)
-    if "option `trust_remote_code=True`" in message:
+    if "trust_remote_code=True" in message:
         return ValueError(
-            message.replace(
-                "option `trust_remote_code=True`",
-                "backend parameter `--trust-remote-code`",
-            )
+            "The model contains custom code that must be executed to load correctly. If you trust the source, please pass the backend parameter `--trust-remote-code` to allow custom code to be run."
         )
     return ValueError("Not a supported model.")
 

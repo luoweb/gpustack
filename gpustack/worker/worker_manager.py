@@ -88,7 +88,6 @@ class WorkerManager:
         worker.name = current.name
         worker.id = current.id
         worker.labels = current.labels
-        worker.state = current.state
         worker.unreachable = current.unreachable
         worker.system_reserved = self._system_reserved
         worker.heartbeat_time = now
@@ -272,6 +271,7 @@ class WorkerManager:
                     gpu_device.vendor,
                     log_file_path,
                     self._rpc_server_cache_dir,
+                    self._cfg.bin_dir,
                     self._rpc_server_args,
                 ),
             )

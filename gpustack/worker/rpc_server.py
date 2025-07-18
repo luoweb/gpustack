@@ -2,9 +2,10 @@ from contextlib import redirect_stderr, redirect_stdout
 import logging
 import multiprocessing
 import os
+from pathlib import Path
 import subprocess
 import sys
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import setproctitle
 
@@ -12,7 +13,11 @@ from gpustack.utils import platform
 from gpustack.utils.command import normalize_parameters
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils.process import add_signal_handlers
-from gpustack.worker.backends.base import get_env_name_by_vendor
+from gpustack.worker.backends.base import get_visible_devices_env_name
+from gpustack.worker.tools_manager import (
+    is_disabled_dynamic_link,
+    BUILTIN_LLAMA_BOX_VERSION,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +43,7 @@ class RPCServer:
         vendor: str,
         log_file_path: str,
         cache_dir: str,
+        bin_dir: Optional[str] = None,
         args: Optional[List[str]] = None,
     ):
         setproctitle.setproctitle(f"gpustack_rpc_server_process: gpu_{gpu_index}")
@@ -45,18 +51,38 @@ class RPCServer:
 
         with open(log_file_path, "w", buffering=1, encoding="utf-8") as log_file:
             with redirect_stdout(log_file), redirect_stderr(log_file):
-                RPCServer._start(port, gpu_index, vendor, cache_dir, args)
+                RPCServer._start(port, gpu_index, vendor, cache_dir, bin_dir, args)
 
     def _start(
         port: int,
         gpu_index: int,
         vendor: str,
         cache_dir: str,
+        bin_dir: Optional[str] = None,
         args: Optional[List[str]] = None,
     ):
-        command_path = pkg_resources.files(
-            "gpustack.third_party.bin.llama-box.llama-box-default"
-        ).joinpath(RPCServer.get_llama_box_rpc_server_command())
+        # Launch llama-box from <third_party>/bin/llama-box/llama-box-default,
+        # if allowing dynamic linking binary,
+        # otherwise use the user-provided binary path in the config,
+        # i.e. <bin_dir>/llama-box/llama-box-<builtin version> or <bin_dir>/llama-box/static/llama-box-<builtin version>.
+        version = BUILTIN_LLAMA_BOX_VERSION
+        disabled_dynamic_link = (
+            is_disabled_dynamic_link(version) and bin_dir is not None
+        )
+        if not disabled_dynamic_link:
+            base_path = str(
+                pkg_resources.files("gpustack.third_party.bin").joinpath(
+                    'llama-box/llama-box-default'
+                )
+            )
+        else:
+            base_path = os.path.join(
+                bin_dir,
+                'llama-box',
+                'static',
+                f'llama-box-{version}',
+            )
+        command_path = get_llama_box_command(base_path)
 
         arguments = [
             "--rpc-server-host",
@@ -84,10 +110,15 @@ class RPCServer:
             args = normalize_parameters(args, removes=remove_arguments)
             arguments.extend(args)
 
-        env_name = get_env_name_by_vendor(vendor)
+        env_name = get_visible_devices_env_name(vendor)
         env = os.environ.copy()
         env[env_name] = str(gpu_index)
-
+        cwd = str(command_path.parent)
+        if platform.system() == "linux":
+            ld_library_path = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = (
+                ":".join([cwd, ld_library_path]) if ld_library_path else cwd
+            )
         try:
             logger.info("Starting llama-box rpc server")
             logger.debug(
@@ -98,16 +129,23 @@ class RPCServer:
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 env=env,
-                cwd=command_path.cwd(),
+                cwd=cwd,
             )
         except Exception as e:
             error_message = f"Failed to run the llama-box rpc server: {e}"
             logger.error(error_message)
             raise Exception(error_message) from e
 
-    @staticmethod
-    def get_llama_box_rpc_server_command() -> str:
-        command = "llama-box-rpc-server"
-        if platform.system() == "windows":
-            command += ".exe"
-        return command
+
+def get_llama_box_command(
+    base_path: Union[
+        str,
+        Path,
+    ],
+) -> Path:
+    command = "llama-box-rpc-server"
+    if platform.system() == "windows":
+        command += ".exe"
+    if isinstance(base_path, str):
+        base_path = Path(base_path)
+    return base_path.joinpath(command)

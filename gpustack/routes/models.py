@@ -24,7 +24,7 @@ from gpustack.schemas.models import (
     BackendEnum,
 )
 from gpustack.schemas.workers import GPUDeviceInfo, VendorEnum, Worker
-from gpustack.server.deps import ListParamsDep, SessionDep
+from gpustack.server.deps import ListParamsDep, SessionDep, EngineDep
 from gpustack.schemas.models import (
     Model,
     ModelCreate,
@@ -42,6 +42,7 @@ router = APIRouter()
 
 @router.get("", response_model=ModelsPublic)
 async def get_models(
+    engine: EngineDep,
     session: SessionDep,
     params: ListParamsDep,
     search: str = None,
@@ -54,7 +55,7 @@ async def get_models(
     if params.watch:
         return StreamingResponse(
             Model.streaming(
-                session,
+                engine,
                 fuzzy_fields=fuzzy_fields,
                 filter_func=lambda data: categories_filter(data, categories),
             ),
@@ -132,7 +133,9 @@ async def get_model(session: SessionDep, id: int):
 
 
 @router.get("/{id}/instances", response_model=ModelInstancesPublic)
-async def get_model_instances(session: SessionDep, id: int, params: ListParamsDep):
+async def get_model_instances(
+    engine: EngineDep, session: SessionDep, id: int, params: ListParamsDep
+):
     model = await Model.one_by_id(session, id)
     if not model:
         raise NotFoundException(message="Model not found")
@@ -140,7 +143,7 @@ async def get_model_instances(session: SessionDep, id: int, params: ListParamsDe
     if params.watch:
         fields = {"model_id": id}
         return StreamingResponse(
-            ModelInstance.streaming(session=session, fields=fields),
+            ModelInstance.streaming(engine, fields=fields),
             media_type="text/event-stream",
         )
 
@@ -254,6 +257,10 @@ async def validate_gpu_ids(  # noqa: C901
                 "Please enable Ray to make vLLM work across multiple workers. "
                 "For more information, please refer to the <a href='https://docs.gpustack.ai/latest/user-guide/inference-backends/#distributed-inference-across-workers-experimental'>documentation</a>."
             )
+        if len(worker_name_set) > 1 and model_in.backend_version:
+            raise BadRequestException(
+                message="Using custom backend version to run vLLM across multiple workers is not supported."
+            )
 
     if model_backend == BackendEnum.LLAMA_BOX:
         ts = find_parameter(model_in.backend_parameters, ["ts", "tensor-split"])
@@ -279,11 +286,8 @@ def validate_gpu(
             f"Ascend MindIE backend requires Ascend NPUs. Selected {gpu_device.vendor} GPU is not supported."
         )
 
-    if model_backend == BackendEnum.VLLM and gpu_device.vendor not in [
-        VendorEnum.NVIDIA.value,
-        VendorEnum.AMD.value,
-        VendorEnum.Hygon.value,
-        VendorEnum.Huawei.value,
+    if model_backend == BackendEnum.VLLM and gpu_device.vendor in [
+        VendorEnum.Apple.value,
     ]:
         raise BadRequestException(
             f"vLLM backend is not supported on {gpu_device.vendor} GPUs."
@@ -300,7 +304,7 @@ async def validate_distributed_vllm_limit_per_worker(
     for instance in instances:
         if (
             instance.distributed_servers
-            and instance.distributed_servers.ray_actors
+            and instance.distributed_servers.subordinate_workers
             and instance.model_name != model.name
         ):
             raise BadRequestException(

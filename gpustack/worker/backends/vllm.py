@@ -15,13 +15,13 @@ from gpustack.utils.hub import (
     get_max_model_len,
     get_pretrained_config,
 )
-from gpustack.worker.backends.base import InferenceServer
+from gpustack.worker.backends.base import InferenceServer, is_ascend_310p
 
 logger = logging.getLogger(__name__)
 
 
 class VLLMServer(InferenceServer):
-    def start(self):
+    def start(self):  # noqa: C901
         try:
             command_path = get_command_path("vllm")
             if self._model.backend_version:
@@ -38,13 +38,25 @@ class VLLMServer(InferenceServer):
             if derived_max_model_len and derived_max_model_len > 8192:
                 arguments.extend(["--max-model-len", "8192"])
 
-            auto_parallism_arguments = get_auto_parallelism_arguments(
+            auto_parallelism_arguments = get_auto_parallelism_arguments(
                 self._model.backend_parameters, self._model_instance
             )
-            arguments.extend(auto_parallism_arguments)
+            arguments.extend(auto_parallelism_arguments)
 
             if is_distributed_vllm(self._model_instance):
                 arguments.extend(["--distributed-executor-backend", "ray"])
+
+            # For Ascend 310P, we need to enforce eager execution and default dtype to float16,
+            # see example of https://vllm-ascend.readthedocs.io/en/latest/tutorials/single_node_300i.html.
+            # As a workaround, we should allow users to override this with backend parameters.
+            if is_ascend_310p(self._worker):
+                arguments.extend(
+                    [
+                        "--enforce-eager",
+                        "--dtype",
+                        "float16",
+                    ]
+                )
 
             if self._model.backend_parameters:
                 arguments.extend(self._model.backend_parameters)
@@ -62,15 +74,25 @@ class VLLMServer(InferenceServer):
             # they cannot be overridden by the user-defined arguments
             arguments.extend(built_in_arguments)
 
-            logger.info("Starting vllm server")
-            logger.debug(f"Run vllm with arguments: {' '.join(arguments)}")
-            if self._model.env:
-                logger.debug(
-                    f"Model environment variables: {', '.join(f'{key}={value}' for key, value in self._model.env.items())}"
-                )
+            logger.info(f"Starting vLLM server: {command_path}")
+            logger.debug(f"Run vLLM with arguments: {' '.join(arguments)}")
             env = os.environ.copy()
             self.set_vllm_distributed_env(env)
             env = self.get_inference_running_env(env)
+            env_view = None
+            if logger.isEnabledFor(logging.DEBUG):
+                env_view = env
+            elif self._model.env:
+                # If the model instance has its own environment variables,
+                # display the mutated environment variables.
+                env_view = self._model.env
+                for k, v in self._model.env.items():
+                    env_view[k] = env.get(k, v)
+            if env_view:
+                logger.info(
+                    f"With environment variables(inconsistent input items mean unchangeable):{os.linesep}"
+                    f"{os.linesep.join(f'{k}={v}' for k, v in sorted(env_view.items()))}"
+                )
             result = subprocess.run(
                 [command_path] + arguments,
                 stdout=sys.stdout,
@@ -79,7 +101,7 @@ class VLLMServer(InferenceServer):
             )
             self.exit_with_code(result.returncode)
         except Exception as e:
-            error_message = f"Failed to run the vllm server: {e}"
+            error_message = f"Failed to run the vLLM server: {e}"
             logger.error(error_message)
             try:
                 patch_dict = {
@@ -94,8 +116,8 @@ class VLLMServer(InferenceServer):
     def set_vllm_distributed_env(self, env: Dict[str, str]):
         model_instance = self._model_instance
         worker = self._worker
-        ray_actors = model_instance.distributed_servers.ray_actors
-        if not ray_actors:
+        subordinate_workers = model_instance.distributed_servers.subordinate_workers
+        if not subordinate_workers:
             return
 
         device_str = "GPU"
@@ -114,16 +136,16 @@ class VLLMServer(InferenceServer):
             bundle_indexes.append(gpu_index)
         bundle_index_offset += len(worker.status.gpu_devices)
 
-        for ray_actor in ray_actors:
-            for i in range(ray_actor.total_gpus):
+        for subordinate_worker in subordinate_workers:
+            for i in range(subordinate_worker.total_gpus):
                 bundle = {
                     device_str: 1,
-                    f"node:{ray_actor.worker_ip}": 0.001,
+                    f"node:{subordinate_worker.worker_ip}": 0.001,
                 }
                 ray_placement_group_bundles.append(bundle)
-            for gpu_index in ray_actor.gpu_indexes:
+            for gpu_index in subordinate_worker.gpu_indexes:
                 bundle_indexes.append(bundle_index_offset + gpu_index)
-            bundle_index_offset += ray_actor.total_gpus
+            bundle_index_offset += subordinate_worker.total_gpus
 
         # encoded to json and set in GPUSTACK_RAY_PLACEMENT_GROUP_BUNDLES env
         env["GPUSTACK_RAY_PLACEMENT_GROUP_BUNDLES"] = json.dumps(
@@ -165,12 +187,14 @@ def get_auto_parallelism_arguments(
 
     if is_distributed_vllm(model_instance):
         # distributed across multiple workers
-        pp = len(model_instance.distributed_servers.ray_actors) + 1
+        pp = len(model_instance.distributed_servers.subordinate_workers) + 1
         tp = len(model_instance.gpu_indexes) if model_instance.gpu_indexes else 1
         uneven_pp = tp
         uneven = False
-        for ray_actor in model_instance.distributed_servers.ray_actors:
-            num_gpus = len(ray_actor.gpu_indexes)
+        for (
+            subordinate_worker
+        ) in model_instance.distributed_servers.subordinate_workers:
+            num_gpus = len(subordinate_worker.gpu_indexes)
             uneven_pp += num_gpus
             if num_gpus != tp:
                 uneven = True
@@ -201,5 +225,5 @@ def get_auto_parallelism_arguments(
 def is_distributed_vllm(model_instance: ModelInstance) -> bool:
     return (
         model_instance.distributed_servers
-        and model_instance.distributed_servers.ray_actors
+        and model_instance.distributed_servers.subordinate_workers
     )
