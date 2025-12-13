@@ -27,6 +27,7 @@ from gpustack.schemas.workers import (
     UptimeInfo,
     GPUDevicesInfo,
     GPUNetworkInfo,
+    ModelInstanceProxyModeEnum,
 )
 from gpustack.schemas.users import AuthProviderEnum
 from gpustack import __version__
@@ -51,7 +52,7 @@ class Config(BaseSettings):
     Attributes:
         port: Port to bind the server to. Default is 80.
         tls_port: Port to bind the TLS server to. Default is 443.
-        api_port: Port to bind the gpustack API server to. Default is 8080.
+        api_port: Port to bind the gpustack API server to. Default is 30080.
         advertise_address: The address to expose for external access. Auto-detected by default.
         debug: Enable debug mode.
         data_dir: Directory to store data. Default is OS specific.
@@ -111,7 +112,7 @@ class Config(BaseSettings):
     port: Optional[int] = 80
     tls_port: Optional[int] = 443
     # The api_port is used in gpustack server/worker serving API requests.
-    api_port: Optional[int] = 8080
+    api_port: Optional[int] = 30080
     advertise_address: Optional[str] = None
     debug: bool = False
     data_dir: Optional[str] = None
@@ -171,9 +172,13 @@ class Config(BaseSettings):
     saml_sp_attribute_prefix: Optional[str] = None  # saml sp attribute prefix
     saml_idp_entity_id: Optional[str] = None  # saml idp_entityId
     saml_idp_server_url: Optional[str] = None  # saml idp_server_url
+    saml_idp_logout_url: Optional[str] = None
+    saml_sp_slo_url: Optional[str] = None
     saml_idp_x509_cert: Optional[str] = ''  # saml idp_x509_cert
     saml_security: Optional[str] = '{}'  # saml security
     server_external_url: Optional[str] = None
+    # custom post-logout redirection key for compatibility with different IdPs.
+    external_auth_post_logout_redirect_key: Optional[str] = None
 
     # Worker options
     token: Optional[str] = None
@@ -193,6 +198,7 @@ class Config(BaseSettings):
     tools_download_base_url: Optional[str] = None
     enable_hf_transfer: bool = False
     enable_hf_xet: bool = False
+    proxy_mode: Optional[ModelInstanceProxyModeEnum] = None
 
     def __init__(self, **values):
         super().__init__(**values)
@@ -235,13 +241,20 @@ class Config(BaseSettings):
         self.init_auth()
 
         if self.system_reserved is None:
-            self.system_reserved = {"ram": 2, "vram": 1}
+            self.system_reserved = {"ram": 0, "vram": 0}
 
         if self.service_discovery_name is None:
             self.service_discovery_name = "worker" if self._is_worker() else "server"
 
         self.make_dirs()
         self.detect_gateway_mode()
+
+        # default to worker proxy mode if running as worker
+        if self.proxy_mode is None:
+            if self._is_worker():
+                self.proxy_mode = ModelInstanceProxyModeEnum.WORKER
+            else:
+                self.proxy_mode = ModelInstanceProxyModeEnum.DIRECT
 
     @model_validator(mode="after")
     def check_all(self):  # noqa: C901

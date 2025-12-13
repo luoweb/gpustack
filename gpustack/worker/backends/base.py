@@ -44,9 +44,9 @@ from gpustack.schemas.workers import GPUDevicesInfo
 from gpustack.server.bus import Event
 from gpustack.utils.gpu import parse_gpu_id
 from gpustack.utils.hub import (
-    get_pretrained_config,
     get_hf_text_config,
     get_max_model_len,
+    get_pretrained_config_with_fallback,
 )
 from gpustack.utils.profiling import time_decorator
 from gpustack.utils import platform
@@ -204,9 +204,16 @@ class InferenceServer(ABC):
 
         Raises:
             RuntimeError:
-                If the distributed follower index cannot be determined.
+                If the model instance is not handling by the current worker.
         """
-        return self._model_instance.get_deployment_metadata(self._worker.id)
+        deployment_metadata = self._model_instance.get_deployment_metadata(
+            self._worker.id
+        )
+        if not deployment_metadata:
+            raise RuntimeError(
+                "Failed to get deployment metadata: model instance is not handling by the current worker"
+            )
+        return deployment_metadata
 
     def _get_pretrained_config(self) -> Optional[Dict]:
         """
@@ -219,7 +226,7 @@ class InferenceServer(ABC):
             return self._pretrained_config
 
         try:
-            pretrained_config = get_pretrained_config(self._model)
+            pretrained_config = get_pretrained_config_with_fallback(self._model)
             self._pretrained_config = pretrained_config
             return pretrained_config
         except Exception as e:
@@ -247,6 +254,22 @@ class InferenceServer(ABC):
             logger.error(f"Failed to derive max model length: {e}")
 
         return default
+
+    def _get_model_architecture(self) -> List[str]:
+        """
+        Get model architecture from model config.
+
+        Returns:
+            A list of model architecture strings.
+        """
+        try:
+            pretrained_config = self._get_pretrained_config()
+            if pretrained_config and "architectures" in pretrained_config:
+                return pretrained_config["architectures"]
+        except Exception as e:
+            logger.error(f"Failed to derive model architecture: {e}")
+
+        return []
 
     def _get_configured_env(self, **kwargs) -> Dict[str, str]:
         """
@@ -623,7 +646,7 @@ $@
                 command=version_config.run_command,
             )
             if command:
-                return command.split()
+                return shlex.split(command)
 
         # Return original default_args by default
         return default_args

@@ -333,7 +333,7 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         type=json.loads,
         help="The system reserves resources during scheduling, measured in GiB. \
         Where RAM is reserved per worker, and VRAM is reserved per GPU device. \
-        By default, 2 GiB of RAM and 1G of VRAM is reserved. \
+        By default, no resources are reserved. \
         Example: '{\"ram\": 2, \"vram\": 1}' or '{\"memory\": 2, \"gpu_memory\": 1}', \
         Note: The 'memory' and 'gpu_memory' keys are deprecated and will be removed in future releases.",
         default=get_gpustack_env("SYSTEM_RESERVED"),
@@ -355,6 +355,14 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         action=OptionalBoolAction,
         help="Enable downloading model files using Hugging Face Xet.",
     )
+    group.add_argument(
+        "--proxy-mode",
+        type=str,
+        help="Proxy mode for server accessing model instances: "
+        "direct (server connects directly) or worker (via worker proxy). "
+        "Default value is direct for embedded worker, and worker for standalone worker.",
+    )
+
     group.add_argument(
         "--enable-cors",
         action=OptionalBoolAction,
@@ -433,6 +441,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         default=get_gpustack_env("OIDC_REDIRECT_URI"),
     )
     group.add_argument(
+        "--external-auth-post-logout-redirect-key",
+        type=str,
+        help="Generic key for post-logout redirection across IdPs.",
+        default=get_gpustack_env("EXTERNAL_AUTH_POST_LOGOUT_REDIRECT_KEY"),
+    )
+    group.add_argument(
         "--oidc-skip-userinfo",
         action=OptionalBoolAction,
         help="Skip using the UserInfo endpoint and retrieve user details from the ID token.",
@@ -450,6 +464,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         type=str,
         help="SAML IdP server URL.",
         default=get_gpustack_env("SAML_IDP_SERVER_URL"),
+    )
+    group.add_argument(
+        "--saml-idp-logout-url",
+        type=str,
+        help="SAML IdP Single Logout endpoint URL.",
+        default=get_gpustack_env("SAML_IDP_LOGOUT_URL"),
     )
     group.add_argument(
         "--saml-idp-entity-id",
@@ -474,6 +494,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         type=str,
         help="SAML SP Assertion Consumer Service(ACS) URL. It should be set to `<server-url>/auth/saml/callback`.",
         default=get_gpustack_env("SAML_SP_ACS_URL"),
+    )
+    group.add_argument(
+        "--saml-sp-slo-url",
+        type=str,
+        help="SAML SP Single Logout Service URL. It can be set to `<server-url>/auth/saml/logout/callback` if you need to receive LogoutResponse.",
+        default=get_gpustack_env("SAML_SP_SLO_URL"),
     )
     group.add_argument(
         "--saml-sp-x509-cert",
@@ -631,13 +657,16 @@ def set_server_options(args, config_data: dict):
         "oidc_client_id",
         "oidc_client_secret",
         "oidc_redirect_uri",
+        "external_auth_post_logout_redirect_key",
         "oidc_skip_userinfo",
         "oidc_use_userinfo",
         "saml_idp_server_url",
+        "saml_idp_logout_url",
         "saml_idp_entity_id",
         "saml_idp_x509_cert",
         "saml_sp_entity_id",
         "saml_sp_acs_url",
+        "saml_sp_slo_url",
         "saml_sp_x509_cert",
         "saml_sp_private_key",
         "saml_sp_attribute_prefix",
@@ -666,6 +695,7 @@ def set_worker_options(args, config_data: dict):
         "tools_download_base_url",
         "enable_hf_transfer",
         "enable_hf_xet",
+        "proxy_mode",
     ]
 
     for option in options:

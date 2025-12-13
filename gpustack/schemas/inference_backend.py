@@ -61,7 +61,9 @@ class InferenceBackendBase(SQLModel):
     default_backend_param: Optional[List[str]] = SQLField(
         sa_column=Column(JSON), default=[]
     )
-    default_run_command: Optional[str] = SQLField(default="")
+    default_run_command: Optional[str] = SQLField(
+        sa_column=Column(Text, nullable=True), default=""
+    )
     is_built_in: bool = SQLField(default=False)
     description: Optional[str] = SQLField(
         default=None, sa_column=Column(Text, nullable=True)
@@ -149,13 +151,32 @@ class InferenceBackendBase(SQLModel):
         return command
 
     def get_image_name(self, version: Optional[str] = None) -> (str, str):
+        """
+        Resolve a user-configured container image for the specified backend version.
+
+        Args:
+            version: Desired backend version; falls back to `default_version` when None.
+
+        Returns:
+            A tuple of (image_name, version). Empty strings indicate no user-configured image.
+        """
+        # CUSTOM backend does not resolve here; image/command come from the model configuration
         if self.backend_name == BackendEnum.CUSTOM.value:
-            return ""
+            return "", ""
         try:
+            # Resolve concrete version and fetch its configuration
             version_config, version = self.get_version_config(version)
         except KeyError:
+            # Version not found or cannot be resolved
             return "", ""
-        return version_config.image_name, version
+        # Only return image for custom version configs (no built-in frameworks) with explicit image
+        if (
+            version_config
+            and version_config.built_in_frameworks is None
+            and version_config.image_name
+        ):
+            return version_config.image_name, version
+        return "", ""
 
 
 class InferenceBackend(InferenceBackendBase, BaseModelMixin, table=True):

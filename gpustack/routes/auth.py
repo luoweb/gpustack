@@ -19,12 +19,17 @@ from gpustack.security import (
     verify_hashed_secret,
 )
 from gpustack import envs
-from gpustack.api.auth import SESSION_COOKIE_NAME, authenticate_user
+from gpustack.api.auth import (
+    SESSION_COOKIE_NAME,
+    OIDC_ID_TOKEN_COOKIE_NAME,
+    authenticate_user,
+)
 from gpustack.server.deps import CurrentUserDep, SessionDep
 from onelogin.saml2.auth import OneLogin_Saml2_Auth
 from fastapi.responses import RedirectResponse
 from lxml import etree
 from gpustack.utils.convert import safe_b64decode, inflate_data
+from urllib.parse import urlencode
 
 router = APIRouter()
 timeout = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=10.0)
@@ -136,6 +141,10 @@ async def init_saml_auth(request: Request):
                 "url": config.saml_sp_acs_url,  # callback url
                 "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
             },
+            "singleLogoutService": {
+                "url": config.saml_sp_slo_url,
+                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+            },
             "x509cert": config.saml_sp_x509_cert,  # SP public key
             "privateKey": config.saml_sp_private_key,  # sp privateKey
         },
@@ -143,6 +152,10 @@ async def init_saml_auth(request: Request):
             "entityId": config.saml_idp_entity_id,  # idp_entityId
             "singleSignOnService": {
                 "url": config.saml_idp_server_url,  # server url
+                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+            },
+            "singleLogoutService": {
+                "url": config.saml_idp_logout_url,
                 "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
             },
             "x509cert": config.saml_idp_x509_cert,  # idp public key
@@ -268,6 +281,18 @@ async def saml_callback(request: Request, session: SessionDep):
         logger.error(f"SAML callback error: {str(e)}")
         raise UnauthorizedException(message=str(e))
 
+    return response
+
+
+@router.api_route("/saml/logout/callback", methods=["GET", "POST"])
+async def saml_logout_callback(request: Request):
+    try:
+        auth = await init_saml_auth(request)
+        auth.process_slo(False)
+    except Exception:
+        pass
+    response = RedirectResponse(url="/")
+    response.delete_cookie(key=SESSION_COOKIE_NAME)
     return response
 
 
@@ -399,6 +424,18 @@ async def oidc_callback(request: Request, session: SessionDep):
         max_age=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
         expires=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
     )
+    try:
+        id_token = res_data.get("id_token")
+        if id_token:
+            response.set_cookie(
+                key=OIDC_ID_TOKEN_COOKIE_NAME,
+                value=id_token,
+                httponly=True,
+                max_age=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
+                expires=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to set id_token cookie: {str(e)}")
     return response
 
 
@@ -429,8 +466,46 @@ async def login(
 
 
 @router.post("/logout")
-async def logout(response: Response):
-    response.delete_cookie(key=SESSION_COOKIE_NAME)
+async def logout(request: Request):
+    config: Config = request.app.state.server_config
+    external_logout_url = None
+    if (
+        config.external_auth_type == AuthProviderEnum.OIDC
+        and config.openid_configuration
+    ):
+        end_session_endpoint = config.openid_configuration.get("end_session_endpoint")
+        if end_session_endpoint:
+            redirect_uri = str(config.server_external_url or request.base_url)
+            params = {
+                "client_id": config.oidc_client_id,
+                "post_logout_redirect_uri": redirect_uri,
+                "id_token_hint": request.cookies.get(OIDC_ID_TOKEN_COOKIE_NAME),
+            }
+            if config.external_auth_post_logout_redirect_key:
+                params[config.external_auth_post_logout_redirect_key] = redirect_uri
+            query = urlencode({k: v for k, v in params.items() if v})
+            external_logout_url = (
+                end_session_endpoint if not query else f"{end_session_endpoint}?{query}"
+            )
+    elif config.external_auth_type == AuthProviderEnum.SAML:
+        try:
+            auth = await init_saml_auth(request)
+            redirect_uri = str(config.server_external_url or request.base_url)
+            params = {}
+            if config.external_auth_post_logout_redirect_key:
+                params[config.external_auth_post_logout_redirect_key] = redirect_uri
+            external_logout_url = auth.logout(return_to=redirect_uri)
+            query = urlencode({k: v for k, v in params.items() if v})
+            if query:
+                external_logout_url += f"&{query}"
+        except Exception as e:
+            logger.error(f"Failed to get SAML logout url: {str(e)}")
+            external_logout_url = None
+    content = json.dumps({"logout_url": external_logout_url})
+    resp = Response(content=content, media_type="application/json")
+    resp.delete_cookie(key=SESSION_COOKIE_NAME)
+    resp.delete_cookie(key=OIDC_ID_TOKEN_COOKIE_NAME)
+    return resp
 
 
 @router.post("/update-password")
