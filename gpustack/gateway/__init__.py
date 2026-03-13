@@ -2,7 +2,12 @@ import time
 import asyncio
 import base64
 import os
-from typing import Any, Dict, Tuple, List
+import logging
+import yaml
+import copy
+from functools import partial
+from typing import Any, Dict, Tuple, List, Optional, Literal
+from pydantic import BaseModel
 from kubernetes_asyncio import client as k8s_client
 from kubernetes_asyncio.client import Configuration
 from kubernetes_asyncio.config.kube_config import KubeConfigLoader, KubeConfigMerger
@@ -12,7 +17,8 @@ from kubernetes_asyncio.config.incluster_config import (
     SERVICE_CERT_FILENAME,
 )
 from kubernetes_asyncio.client.rest import ApiException
-from gpustack.config.config import Config, GatewayModeEnum
+from gpustack.config.config import Config
+from gpustack.schemas.config import GatewayModeEnum
 from gpustack import envs
 from gpustack.gateway import client as gw_client
 from gpustack.gateway.client import (
@@ -20,11 +26,15 @@ from gpustack.gateway.client import (
     McpBridgeSpec,
     McpBridgeRegistry,
     WasmPluginSpec,
+    WasmPluginMatchRule,
 )
 from gpustack.gateway.labels_annotations import managed_labels, match_labels
 from gpustack.gateway.utils import (
     default_mcp_bridge_name,
     openai_model_prefixes,
+    anthropic_model_exact,
+    gpustack_ai_proxy_name,
+    gpustack_model_mapper_name,
     mcp_ingress_equal,
     get_default_mcpbridge_ref,
     ensure_wasm_plugin,
@@ -33,16 +43,58 @@ from gpustack.gateway.plugins import (
     get_plugin_url_with_name_and_version,
 )
 
+logger = logging.getLogger(__name__)
+
 mcp_registry_port = 80
 
 supported_openai_routes = [
     route for v in openai_model_prefixes for route in v.flattened_prefixes()
 ]
 
+supported_anthropic_routes = [
+    route for v in anthropic_model_exact for route in v.flattened_prefixes()
+]
+
+async_gateway_config: Configuration = None
+router_header_key = "x-gpustack-model"
+
+
+def init_async_k8s_config(cfg: Config):
+    if cfg.gateway_mode == GatewayModeEnum.disabled:
+        return
+    global async_gateway_config
+    if async_gateway_config is not None:
+        return
+    configuration = Configuration()
+    if cfg.gateway_mode == GatewayModeEnum.incluster:
+        cfg_loader = InClusterConfigLoader(
+            token_filename=SERVICE_TOKEN_FILENAME,
+            cert_filename=SERVICE_CERT_FILENAME,
+        )
+        cfg_loader.load_and_set(configuration)
+    else:
+        cfg_loader = KubeConfigLoader(
+            config_dict=KubeConfigMerger(cfg.gateway_kubeconfig).config
+        )
+        if not cfg_loader._load_user_token():
+            cfg_loader._load_user_pass_token()
+        cfg_loader._load_cluster_info()
+        cfg_loader._set_config(configuration)
+    async_gateway_config = configuration
+
+
+def get_async_k8s_config(cfg: Config) -> Optional[Configuration]:
+    if cfg.gateway_mode == GatewayModeEnum.disabled:
+        return None
+    global async_gateway_config
+    if async_gateway_config is None:
+        init_async_k8s_config(cfg=cfg)
+    return async_gateway_config
+
 
 def wait_for_apiserver_ready(cfg: Config, timeout: int = 60, interval: int = 5):
     async def get_api_resources():
-        config = cfg.get_async_k8s_config()
+        config = get_async_k8s_config(cfg)
         start = time.time()
         v1 = k8s_client.CoreV1Api(k8s_client.ApiClient(configuration=config))
         while True:
@@ -61,9 +113,11 @@ def wait_for_apiserver_ready(cfg: Config, timeout: int = 60, interval: int = 5):
 
 
 def get_gpustack_higress_registry(cfg: Config) -> McpBridgeRegistry:
+    # this is only for non-incluster mode.
+    # In this case, the related resource will be installed into gateway namespace.
     # default to incluster mode
     registry_type = "dns"
-    domain = f"{cfg.service_discovery_name}.{cfg.get_gateway_namespace()}.svc"
+    domain = f"{cfg.service_discovery_name}.{cfg.gateway_namespace}.svc"
     if cfg.gateway_mode != GatewayModeEnum.incluster:
         registry_type = "static"
         port = cfg.get_api_port()
@@ -91,7 +145,7 @@ def get_gpustack_higress_registry(cfg: Config) -> McpBridgeRegistry:
 async def ensure_mcp_resources(cfg: Config, api_client: k8s_client.ApiClient):
     api = gw_client.NetworkingHigressIoV1Api(api_client)
     # use default name for embedded mode
-    gateway_namespace = cfg.get_gateway_namespace()
+    gateway_namespace = cfg.gateway_namespace
     try:
         data: Dict[str, Any] = await api.get_mcpbridge(
             namespace=gateway_namespace, name=default_mcp_bridge_name
@@ -148,11 +202,11 @@ async def ensure_ingress_resources(cfg: Config, api_client: k8s_client.ApiClient
     """
     Ensure the ingress resources to route traffic to mcpbridge are created.
     """
-    gateway_namespace = cfg.get_gateway_namespace()
+    gateway_namespace = cfg.gateway_namespace
     hostname = cfg.get_external_hostname()
     tls_secret_name = cfg.get_tls_secret_name()
     network_v1_client = k8s_client.NetworkingV1Api(api_client=api_client)
-    ingress_name = "gpustack"
+    ingress_name = envs.GATEWAY_MIRROR_INGRESS_NAME
     try:
         ingress: k8s_client.V1Ingress = await network_v1_client.read_namespaced_ingress(
             name=ingress_name, namespace=gateway_namespace
@@ -163,34 +217,33 @@ async def ensure_ingress_resources(cfg: Config, api_client: k8s_client.ApiClient
         else:
             raise
     registry = get_gpustack_higress_registry(cfg=cfg)
+    expected_rule = k8s_client.V1IngressRule(
+        http=k8s_client.V1HTTPIngressRuleValue(
+            paths=[
+                k8s_client.V1HTTPIngressPath(
+                    path="/",
+                    path_type="Prefix",
+                    backend=k8s_client.V1IngressBackend(
+                        resource=get_default_mcpbridge_ref()
+                    ),
+                )
+            ]
+        ),
+    )
 
     expected_ingress = k8s_client.V1Ingress(
         metadata=k8s_client.V1ObjectMeta(
             name=ingress_name,
             namespace=gateway_namespace,
             annotations={
-                "higress.io/destination": f"{registry.name}.{registry.type}:{registry.port}",
+                "higress.io/destination": f"{registry.get_service_name_with_port()}",
                 "higress.io/ignore-path-case": "false",
             },
             labels=managed_labels,
         ),
         spec=k8s_client.V1IngressSpec(
             ingress_class_name='higress',
-            rules=[
-                k8s_client.V1IngressRule(
-                    http=k8s_client.V1HTTPIngressRuleValue(
-                        paths=[
-                            k8s_client.V1HTTPIngressPath(
-                                path="/",
-                                path_type="Prefix",
-                                backend=k8s_client.V1IngressBackend(
-                                    resource=get_default_mcpbridge_ref()
-                                ),
-                            )
-                        ]
-                    ),
-                )
-            ],
+            rules=[expected_rule],
         ),
     )
     if tls_secret_name is not None:
@@ -200,6 +253,11 @@ async def ensure_ingress_resources(cfg: Config, api_client: k8s_client.ApiClient
                 secret_name=tls_secret_name,
             )
         ]
+    if hostname is not None:
+        host_rule = copy.deepcopy(expected_rule)
+        host_rule.host = hostname
+        expected_ingress.spec.rules.append(host_rule)
+
     if not ingress:
         await network_v1_client.create_namespaced_ingress(
             namespace=gateway_namespace, body=expected_ingress
@@ -212,41 +270,74 @@ async def ensure_ingress_resources(cfg: Config, api_client: k8s_client.ApiClient
             )
 
 
+def get_match_rules(
+    match_type: Literal["whitelist", "blacklist"],
+    paths: List[Tuple[str, str]],
+) -> Dict[str, Any]:
+    match_list = [
+        {
+            "match_rule_path": pair[0],
+            "match_rule_type": pair[1],
+        }
+        for pair in paths
+    ]
+    return {
+        "match_list": match_list,
+        "match_type": match_type,
+    }
+
+
 def ext_auth_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     resource_name = "gpustack-llm-ext-auth"
     registry = get_gpustack_higress_registry(cfg=cfg)
-    match_list = [
-        {"match_rule_path": route, "match_rule_type": "exact"}
-        for route in supported_openai_routes
-    ]
-    match_list.append({"match_rule_path": "/model/proxy", "match_rule_type": "prefix"})
+
+    # this is to auth requests except for gpustack
+    default_match_rule = get_match_rules(
+        match_type="blacklist",
+        paths=[("/", "prefix")],
+    )
+    gpustack_match_rule = get_match_rules(
+        match_type="whitelist",
+        paths=[("/", "prefix")],
+    )
+
+    http_service = {
+        "authorization_request": {
+            "allowed_headers": [
+                {"exact": "X-GPUStack-Real-IP"},
+                {"exact": "x-higress-llm-model"},
+                {"exact": "x-api-key"},
+                {"exact": "cookie"},
+            ]
+        },
+        "authorization_response": {
+            "allowed_upstream_headers": [
+                {"exact": "X-Mse-Consumer"},
+                {"exact": "Authorization"},
+                {"exact": "cookie"},
+                {"exact": "X-GPUStack-Original-Cookies"},
+                {"exact": "X-GPUStack-Original-Authorization"},
+            ]
+        },
+        "endpoint": {
+            "path": "/token-auth",
+            "request_method": "GET",
+            "service_name": registry.get_service_name(),
+            "service_port": registry.port,
+        },
+        "endpoint_mode": "forward_auth",
+        "timeout": envs.HIGRESS_EXT_AUTH_TIMEOUT_MS,
+    }
+    namespace = cfg.get_namespace()
+    if namespace == cfg.gateway_namespace:
+        namespace = ""
+    # the ingress in plugin matchRules should not contains namespace prefix
+    # if it is in the same namespace with the gateway.
+    ingress_name = f"{namespace}/{envs.GATEWAY_MIRROR_INGRESS_NAME}".lstrip("/")
     expected_spec = WasmPluginSpec(
         defaultConfig={
-            "http_service": {
-                "authorization_request": {
-                    "allowed_headers": [
-                        {"exact": "X-GPUStack-Real-IP"},
-                        {"exact": "x-higress-llm-model"},
-                        {"exact": "cookie"},
-                    ]
-                },
-                "authorization_response": {
-                    "allowed_upstream_headers": [
-                        {"exact": "X-Mse-Consumer"},
-                        {"exact": "Authorization"},
-                    ]
-                },
-                "endpoint": {
-                    "path": "/token-auth",
-                    "request_method": "GET",
-                    "service_name": f"{registry.name}.{registry.type}",
-                    "service_port": registry.port,
-                },
-                "endpoint_mode": "forward_auth",
-                "timeout": envs.HIGRESS_EXT_AUTH_TIMEOUT_MS,
-            },
-            "match_list": match_list,
-            "match_type": "blacklist",
+            "http_service": http_service,
+            **default_match_rule,
         },
         defaultConfigDisable=False,
         failStrategy="FAIL_OPEN",
@@ -255,6 +346,16 @@ def ext_auth_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         url=get_plugin_url_with_name_and_version(
             name="ext-auth", version="2.0.0", cfg=cfg
         ),
+        matchRules=[
+            WasmPluginMatchRule(
+                config={
+                    "http_service": http_service,
+                    **gpustack_match_rule,
+                },
+                configDisable=False,
+                ingress=[ingress_name],
+            )
+        ],
     )
     return resource_name, expected_spec
 
@@ -263,6 +364,7 @@ def ai_statistics_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     resource_name = "gpustack-ai-statistics"
     expected_spec = WasmPluginSpec(
         defaultConfig={
+            "enable_content_types": envs.GATEWAY_AI_STATISTICS_PLUGIN_CONTENT_TYPES,
             "attributes": [
                 {
                     "apply_to_log": True,
@@ -271,7 +373,7 @@ def ai_statistics_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
                     "value": "x-mse-consumer",
                     "value_source": "request_header",
                 }
-            ]
+            ],
         },
         defaultConfigDisable=False,
         failStrategy="FAIL_OPEN",
@@ -288,7 +390,7 @@ def ai_statistics_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
 
 def model_router_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     resource_name = "gpustack-model-router"
-    enabled_paths = supported_openai_routes.copy()
+    enabled_paths = supported_openai_routes + supported_anthropic_routes
     enabled_paths.append("/model/proxy")
     expected_spec = WasmPluginSpec(
         defaultConfig={
@@ -308,20 +410,124 @@ def model_router_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     return resource_name, expected_spec
 
 
+def model_pre_route_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
+    resource_name = "gpustack-set-model-pre-route"
+    enabled_path_suffixes = supported_openai_routes + supported_anthropic_routes
+    enabled_path_prefixes = ["/model/proxy"]
+    expected_spec = WasmPluginSpec(
+        defaultConfig={
+            'clusterNameHeader': 'X-GPUStack-Model',
+            'routeNameHeader': 'X-GPUStack-Route-Name',
+            'enableOnPathSuffix': enabled_path_suffixes,
+            'enableOnPathPrefix': enabled_path_prefixes,
+        },
+        defaultConfigDisable=False,
+        failStrategy="FAIL_OPEN",
+        imagePullPolicy="UNSPECIFIED_POLICY",
+        matchRules=[],
+        phase="AUTHN",
+        priority=90,
+        url=get_plugin_url_with_name_and_version(
+            name="gpustack-set-header-pre-route", version="1.0.0", cfg=cfg
+        ),
+    )
+    return resource_name, expected_spec
+
+
+def model_mapper_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
+    return gpustack_model_mapper_name, WasmPluginSpec(
+        phase="AUTHN",
+        priority=800,
+        url=get_plugin_url_with_name_and_version(
+            name="model-mapper", version="2.0.0", cfg=cfg
+        ),
+        defaultConfigDisable=False,
+        defaultConfig={"modelMapping": {}},
+        matchRules=[],
+        failStrategy="FAIL_OPEN",
+    )
+
+
+class HeaderRule(BaseModel):
+    key: Optional[str] = None
+    newKey: Optional[str] = None
+    oldKey: Optional[str] = None
+    fromKey: Optional[str] = None
+    toKey: Optional[str] = None
+    value: Optional[str] = None
+    newValue: Optional[str] = None
+    appendValue: Optional[str] = None
+    value_type: Optional[Literal["object", "bool", "number", "string"]] = None
+    strategy: Optional[Literal["RETAIN_FIRST", "RETAIN_LAST", "RETAIN_UNIQUE"]] = None
+    host_pattern: Optional[str] = None
+    path_pattern: Optional[str] = None
+
+
+def transform_header(
+    operate: Literal["remove", "rename", "replace", "add", "append", "map", "dedupe"],
+    *rules: HeaderRule,
+) -> Dict[str, Any]:
+    # TODO: add validation in the future
+    return {
+        "headers": [rule.model_dump(exclude_none=True) for rule in rules],
+        "operate": operate,
+    }
+
+
 def transformer_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     resource_name = "gpustack-header-transformer"
     expected_spec = WasmPluginSpec(
         defaultConfig={
             "reqRules": [
-                {
-                    "headers": [
-                        {
-                            "newKey": "x-higress-llm-model",
-                            "oldKey": "x-gpustack-model",
-                        }
-                    ],
-                    "operate": "rename",
-                }
+                transform_header(
+                    "rename",
+                    HeaderRule(
+                        oldKey="x-gpustack-model",
+                        newKey="x-higress-llm-model",
+                    ),
+                    HeaderRule(
+                        oldKey="x-gpustack-original-path",
+                        newKey=":path",
+                    ),
+                    HeaderRule(
+                        oldKey="x-gpustack-original-cookies",
+                        newKey="cookie",
+                    ),
+                    HeaderRule(
+                        oldKey="x-gpustack-original-authorization",
+                        newKey="authorization",
+                    ),
+                ),
+                transform_header(
+                    "dedupe",
+                    HeaderRule(
+                        key="x-gpustack-model",
+                        strategy="RETAIN_FIRST",
+                    ),
+                    HeaderRule(
+                        key="x-higress-llm-model",
+                        strategy="RETAIN_FIRST",
+                    ),
+                    HeaderRule(
+                        key=":path",
+                        strategy="RETAIN_LAST",
+                    ),
+                    HeaderRule(
+                        key="cookie",
+                        strategy="RETAIN_LAST",
+                    ),
+                    HeaderRule(
+                        key="authorization",
+                        strategy="RETAIN_LAST",
+                    ),
+                ),
+                transform_header(
+                    "map",
+                    HeaderRule(
+                        fromKey=':path',
+                        toKey='x-gpustack-original-path',
+                    ),
+                ),
             ],
         },
         defaultConfigDisable=False,
@@ -329,7 +535,7 @@ def transformer_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         imagePullPolicy="UNSPECIFIED_POLICY",
         matchRules=[],
         phase="AUTHN",
-        priority=410,
+        priority=810,
         url=get_plugin_url_with_name_and_version(
             name="transformer", version="2.0.0", cfg=cfg
         ),
@@ -356,6 +562,23 @@ def token_usage_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     return resource_name, expected_spec
 
 
+def ai_proxy_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
+    resource_name = gpustack_ai_proxy_name
+    expected_spec = WasmPluginSpec(
+        defaultConfig={},
+        defaultConfigDisable=False,
+        failStrategy="FAIL_OPEN",
+        imagePullPolicy="UNSPECIFIED_POLICY",
+        matchRules=[],
+        priority=100,
+        phase="UNSPECIFIED_PHASE",
+        url=get_plugin_url_with_name_and_version(
+            name="ai-proxy", version="2.0.0", cfg=cfg
+        ),
+    )
+    return resource_name, expected_spec
+
+
 async def ensure_tls_secret(cfg: Config, api_client: k8s_client.ApiClient):
     """
     Ensure the TLS secret if ssl key pair is provided.
@@ -377,7 +600,7 @@ async def ensure_tls_secret(cfg: Config, api_client: k8s_client.ApiClient):
     ssl_key_data = base64.b64encode(ssl_key_bytes).decode()
     ssl_cert_data = base64.b64encode(ssl_cert_bytes).decode()
 
-    gateway_namespace = cfg.get_gateway_namespace()
+    gateway_namespace = cfg.gateway_namespace
     core_v1_client = k8s_client.CoreV1Api(api_client=api_client)
     secret_name = cfg.get_tls_secret_name()
     to_create_tls_secret = k8s_client.V1Secret(
@@ -414,54 +637,116 @@ async def ensure_tls_secret(cfg: Config, api_client: k8s_client.ApiClient):
             )
 
 
-def set_async_k8s_config(cfg: Config):
-    configuration = Configuration()
-    if cfg.gateway_mode == GatewayModeEnum.incluster:
-        cfg_loader = InClusterConfigLoader(
-            token_filename=SERVICE_TOKEN_FILENAME,
-            cert_filename=SERVICE_CERT_FILENAME,
+async def ensure_gateway_timeout(cfg: Config, api_client: k8s_client.ApiClient):
+    namespace = cfg.gateway_namespace
+    higress_config_name = "higress-config"
+    core_v1_client = k8s_client.CoreV1Api(api_client=api_client)
+    try:
+        higress_config: k8s_client.V1ConfigMap = (
+            await core_v1_client.read_namespaced_config_map(
+                name=higress_config_name, namespace=namespace
+            )
         )
-        cfg_loader.load_and_set(configuration)
-    else:
-        cfg_loader = KubeConfigLoader(
-            config_dict=KubeConfigMerger(cfg.gateway_kubeconfig).config
+        should_update = False
+        config_data: str = higress_config.data["higress"]
+        config = yaml.safe_load(config_data)
+        idle_timeout = (
+            config.get("downstream", {}).get("idleTimeout")
+            if isinstance(config, dict)
+            else None
         )
-        if not cfg_loader._load_user_token():
-            cfg_loader._load_user_pass_token()
-        cfg_loader._load_cluster_info()
-        cfg_loader._set_config(configuration)
-    cfg.set_async_k8s_config(configuration)
+        if idle_timeout is None or str(idle_timeout) != f"{envs.PROXY_TIMEOUT}":
+            config.setdefault("downstream", {})["idleTimeout"] = envs.PROXY_TIMEOUT
+            higress_config.data["higress"] = yaml.safe_dump(config)
+            should_update = True
+        upstream_idle_timeout = (
+            config.get("upstream", {}).get("idleTimeout")
+            if isinstance(config, dict)
+            else None
+        )
+        if (
+            upstream_idle_timeout is None
+            or str(upstream_idle_timeout) != f"{envs.PROXY_UPSTREAM_IDLE_TIMEOUT}"
+        ):
+            config.setdefault("upstream", {})[
+                "idleTimeout"
+            ] = envs.PROXY_UPSTREAM_IDLE_TIMEOUT
+            higress_config.data["higress"] = yaml.safe_dump(config)
+            should_update = True
+        if should_update:
+            await core_v1_client.replace_namespaced_config_map(
+                name=higress_config_name,
+                namespace=namespace,
+                body=higress_config,
+            )
+    except Exception as e:
+        logger.error(f"Failed to read or parse Higress config map: {e}")
+        raise
+
+
+def spec_replace(
+    current_spec: Optional[WasmPluginSpec],
+    expected_spec: WasmPluginSpec,
+    create_only: bool = False,
+) -> WasmPluginSpec:
+    if current_spec is None:
+        return expected_spec
+    if create_only:
+        return current_spec
+    return expected_spec
+
+
+def validate_ai_statistics_plugin_content_types():
+    for content_type in envs.GATEWAY_AI_STATISTICS_PLUGIN_CONTENT_TYPES:
+        if content_type == "audio/pcm":
+            raise ValueError(
+                "audio/pcm content type is not supported in ai statistics plugin"
+            )
 
 
 def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
     if cfg.gateway_mode == GatewayModeEnum.disabled:
         return
-    set_async_k8s_config(cfg=cfg)
+    init_async_k8s_config(cfg=cfg)
     wait_for_apiserver_ready(cfg=cfg, timeout=timeout, interval=interval)
     if cfg.gateway_mode in [
         GatewayModeEnum.embedded,
         GatewayModeEnum.external,
     ]:
+        validate_ai_statistics_plugin_content_types()
         plugin_list: List[Tuple[str, WasmPluginSpec]] = [
             ext_auth_plugin(cfg=cfg),
             ai_statistics_plugin(cfg=cfg),
             model_router_plugin(cfg=cfg),
+            ai_proxy_plugin(cfg=cfg),
+            model_pre_route_plugin(cfg=cfg),
+            model_mapper_plugin(cfg=cfg),
         ]
         if cfg.server_role() != Config.ServerRole.WORKER:
             plugin_list.append(transformer_plugin(cfg=cfg))
             plugin_list.append(token_usage_plugin(cfg=cfg))
 
         async def prepare():
-            api_client = k8s_client.ApiClient(configuration=cfg.get_async_k8s_config())
+            api_client = k8s_client.ApiClient(
+                configuration=get_async_k8s_config(cfg=cfg)
+            )
+            await ensure_gateway_timeout(cfg=cfg, api_client=api_client)
             await ensure_tls_secret(cfg=cfg, api_client=api_client)
             await ensure_mcp_resources(cfg=cfg, api_client=api_client)
             await ensure_ingress_resources(cfg=cfg, api_client=api_client)
             for plugin_name, plugin_spec in plugin_list:
+                create_only = plugin_name in [
+                    gpustack_ai_proxy_name,
+                    gpustack_model_mapper_name,
+                ]
+                spec_diff_func = partial(
+                    spec_replace, expected_spec=plugin_spec, create_only=create_only
+                )
                 await ensure_wasm_plugin(
                     api=gw_client.ExtensionsHigressIoV1Api(api_client),
                     name=plugin_name,
-                    namespace=cfg.get_gateway_namespace(),
-                    expected=plugin_spec,
+                    namespace=cfg.gateway_namespace,
+                    spec_diff=spec_diff_func,
                 )
 
         try:

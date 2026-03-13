@@ -3,7 +3,7 @@ import logging
 import gzip
 import os
 import tempfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 import fnmatch
 from threading import Lock
@@ -21,12 +21,18 @@ from requests.exceptions import HTTPError
 
 from gpustack.config.config import get_global_config
 from gpustack.schemas import ModelFile
-from gpustack.schemas.models import CategoryEnum, Model, SourceEnum, get_mmproj_filename
+from gpustack.schemas.models import (
+    CategoryEnum,
+    Model,
+    SourceEnum,
+    get_mmproj_filename,
+)
 from gpustack.utils.cache import is_cached, load_cache, save_cache
 
 logger = logging.getLogger(__name__)
 
 LIST_REPO_CACHE_DIR = "repo-skeleton"
+
 
 MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN = [
     '*.json',
@@ -263,17 +269,17 @@ def match_model_scope_file_paths(
     return matching_paths
 
 
-def read_repo_file_content(
+def read_repo_file_content(  # noqa: C901
     model: Model,
     file_path: str,
     token: Optional[str] = None,
-) -> Optional[bytes]:
+) -> Optional[Dict[str, Any]]:
     """
-    Read a file's raw bytes from the model's source.
+    Read a JSON config file from the model's source.
 
     - Hugging Face: uses HfFileSystem to open `{repo_id}/{file_path}`.
     - ModelScope: downloads a snapshot matching `file_path` and cleaned automatically after reading locally.
-    - Local Path: reads from the local directory.
+    - Local Path: reads from the local directory only (no worker broadcast).
 
     Returns None if the file cannot be found or read.
     """
@@ -294,7 +300,7 @@ def read_repo_file_content(
                         logger.warning(
                             f"Failed to decompress gzip content for {file_path}: {e}"
                         )
-                return content
+                return json.loads(content)
 
         elif model.source == SourceEnum.MODEL_SCOPE:
             _cfg = get_global_config()
@@ -325,19 +331,19 @@ def read_repo_file_content(
                             break
                 if not fp:
                     return None
-                with open(fp, "rb") as f:
-                    return f.read()
+                with open(fp, "r", encoding="utf-8") as f:
+                    return json.load(f)
 
         elif model.source == SourceEnum.LOCAL_PATH:
             local_path = model.local_path or ""
             if not local_path or not os.path.isdir(local_path):
                 return None
             fp = os.path.join(local_path, file_path)
-            if not os.path.exists(fp):
-                return None
-            with open(fp, "rb") as f:
-                return f.read()
+            if os.path.exists(fp):
+                with open(fp, "r", encoding="utf-8") as f:
+                    return json.load(f)
 
+            return None
         else:
             return None
     except Exception as e:
@@ -362,6 +368,9 @@ def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
         int: The size of the model weights
     """
     weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
+    # consolidated.safetensors is usually a duplicate of other weight files. Exclude by default.
+    # Example: https://huggingface.co/mistralai/Voxtral-Small-24B-2507
+    exclude_files = ["consolidated.safetensors"]
     if model.source == SourceEnum.HUGGING_FACE:
         repo_id = model.huggingface_repo_id
     elif model.source == SourceEnum.MODEL_SCOPE:
@@ -372,8 +381,56 @@ def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
     return sum(
         file.get("size", 0)
         for file in repo_file_infos
-        if file.get("name", "").endswith(weight_file_extensions)
+        if (
+            file.get("name", "").endswith(weight_file_extensions)
+            and file.get("name", "") not in exclude_files
+        )
     )
+
+
+def get_diffusion_model_weight_size(model: Model, token: Optional[str] = None) -> int:
+    """
+    Get the size of the diffusion model weights.
+    This is the sum of all weight files with extensions .safetensors, .bin, .pt, or .pth located in the root directory
+    and also specified in the model_index.
+    Args:
+        model: Model to get the weight size for
+        token: Optional Hugging Face API token
+    Returns:
+        int: The size of the model weights
+    """
+    weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
+    if model.source == SourceEnum.HUGGING_FACE:
+        repo_id = model.huggingface_repo_id
+    elif model.source == SourceEnum.MODEL_SCOPE:
+        repo_id = model.model_scope_model_id
+    else:
+        raise ValueError(f"Unknown source {model.source}")
+    if not model.categories or CategoryEnum.IMAGE not in model.categories:
+        raise ValueError("Model is not an image model")
+
+    # In different repositories, model files may be stored in different dir.
+    # However, during runtime, the diffusers loads components from corresponding dir according to the pipeline defined in model_index.json.
+    # We can follow the definition in model_index.json to determine which file weights should be included in the calculation.
+    pipeline_data = read_repo_file_content(model, "model_index.json", token=token)
+    if pipeline_data is None:
+        raise ValueError(f"No model_index.json in repo {repo_id}")
+    if isinstance(pipeline_data, list) and len(pipeline_data) > 0:
+        pipeline_data = pipeline_data[0]
+
+    sum_size = 0
+    repo_file_infos = list_repo(repo_id, model.source, token=token, root_dir_only=False)
+    for file_info in repo_file_infos:
+        name_split = file_info.get("name", "").split("/", 1)
+        if (
+            len(name_split) <= 1
+            or pipeline_data.get(name_split[0], None) is None
+            or not name_split[1].endswith(weight_file_extensions)
+        ):
+            continue
+        sum_size += file_info.get("size", 0)
+
+    return sum_size
 
 
 def get_pretrained_config(model: Model, **kwargs):
@@ -438,54 +495,6 @@ def get_pretrained_config(model: Model, **kwargs):
 
     else:
         raise ValueError(f"Unsupported model source: {model.source}")
-
-    return pretrained_config
-
-
-def get_pretrained_config_with_fallback(model: Model, **kwargs):
-    pretrained_config = None
-    try:
-        pretrained_config = get_pretrained_config(model, **kwargs)
-    except Exception as e:
-        logger.debug(
-            "Fallback to load config.json after AutoConfig.from_pretrained failed"
-        )
-
-        if model.backend_version is not None or isinstance(e, ImportError):
-            # Fallback:
-            # AutoConfig.from_pretrained performs strict architecture validation and may fail in several cases, like:
-            #   1. Models using custom or backend-specific architectures not recognized by the current Transformers version.
-            #   2. Newly released models whose architectures are not yet supported in older AutoConfig implementations.
-            #   3. Import-time failures caused by missing or conflicting dependencies
-            #      (e.g., LlamaFlashAttention2 import errors — see: https://github.com/deepseek-ai/DeepSeek-OCR/issues/7).
-            # In all such cases, fallback to loading config.json directly to avoid blocking model startup.
-            try:
-                # try to read config.json and ensure num_attention_heads not None.
-                config_content = read_repo_file_content(
-                    model,
-                    "config.json",
-                    token=get_global_config().huggingface_token,
-                )
-                if config_content:
-                    try:
-                        try:
-                            content = (config_content or b"").decode("utf-8")
-                        except Exception:
-                            content = (config_content or b"").decode()
-                        config_dict = json.loads(content)
-                        pretrained_config = PretrainedConfig.from_dict(config_dict)
-                    except Exception as ce:
-                        logger.warning(f"read_repo_file_content failed: {ce}")
-            except Exception as ce:
-                logger.warning(f"Fallback to load config.json failed: {ce}")
-
-        if (
-            pretrained_config is None
-            and CategoryEnum.LLM in model.categories
-            and (not model.env or not model.env.get("GPUSTACK_MODEL_EVALUATION_SKIP"))
-        ):
-            # For LLM models: empty config is unacceptable → raise original error
-            raise e
 
     return pretrained_config
 
@@ -559,18 +568,21 @@ def get_max_model_len(pretrained_config) -> int:  # noqa: C901
     return int(derived_max_model_len)
 
 
-# Similar to https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/transformers_utils/config.py#L700,
+# Similar to https://github.com/vllm-project/vllm/blob/89a77b10846fd96273cce78d86d2556ea582d26e/vllm/transformers_utils/config.py#L978,
 # But we don't assert and fail if num_attention_heads is missing.
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.
     """
-    if hasattr(config, "text_config") and hasattr(
-        config.text_config, "num_attention_heads"
-    ):
-        return config.text_config
-    else:
-        return config
+    if hasattr(config, "text_config"):
+        text_config = config.get_text_config()
+        if text_config is not None:
+            if isinstance(text_config, dict):
+                text_config = PretrainedConfig.from_dict(text_config)
+            if hasattr(text_config, "num_attention_heads"):
+                return text_config
+
+    return config
 
 
 quantization_list = [
@@ -651,34 +663,32 @@ def get_model_scope_model_min_gguf_path(
     return gguf_files[0]
 
 
-def has_diffusers_model_index(  # noqa: C901
-    model: Model, token: Optional[str] = None
+def has_diffusers_model_index(
+    model: Model,
+    token: Optional[str] = None,
 ) -> bool:
     """Check whether the model source contains a model_index.json with
     the key "_diffusers_version".
 
+    This function only handles direct file access (Hub sources and local files).
+    For LOCAL_PATH models that require worker queries, use
+    check_diffusers_model_index_from_workers() in calculator.py instead.
+
     Supported sources:
     - Hugging Face: checks via HfFileSystem
     - ModelScope: downloads only model_index.json via snapshot_download and inspects
-    - Local Path: reads model_index.json in the provided directory
+    - Local Path: reads model_index.json in the local directory only
+
+    Args:
+        model: Model to check
+        token: Optional Hugging Face API token
+
+    Returns:
+        True if model_index.json contains _diffusers_version, False otherwise
     """
     try:
-        content_bytes: Optional[bytes] = None
-
-        # Read model_index.json content based on model source
-        content_bytes = read_repo_file_content(model, "model_index.json", token=token)
-        if content_bytes is None:
-            return False
-
-        # Decode and parse JSON
-        try:
-            content = (content_bytes or b"").decode("utf-8")
-        except Exception:
-            content = (content_bytes or b"").decode()
-
-        try:
-            data = json.loads(content)
-        except Exception:
+        data = read_repo_file_content(model, "model_index.json", token=token)
+        if data is None:
             return False
 
         # The typical structure is a dict containing _diffusers_version

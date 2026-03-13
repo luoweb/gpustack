@@ -1,23 +1,23 @@
 import os
 import secrets
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Dict
 from urllib.parse import urlparse
 import ipaddress
 
 from gpustack_runtime.detector import (
     manufacturer_to_backend,
-    supported_manufacturers,
-    supported_backends,
+    available_manufacturers,
+    available_backends,
 )
 from pydantic import model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 import requests
 from gpustack.utils import validators
 from gpustack.schemas.workers import (
     CPUInfo,
     FileSystemInfo,
-    GPUDeviceInfo,
+    GPUDeviceStatus,
     KernelInfo,
     MemoryInfo,
     MountPoint,
@@ -25,28 +25,41 @@ from gpustack.schemas.workers import (
     SwapInfo,
     SystemInfo,
     UptimeInfo,
-    GPUDevicesInfo,
+    GPUDevicesStatus,
     GPUNetworkInfo,
-    ModelInstanceProxyModeEnum,
 )
 from gpustack.schemas.users import AuthProviderEnum
+from gpustack.schemas.config import (
+    ModelInstanceProxyModeEnum,
+    PredefinedConfig,
+    PredefinedConfigNoDefaults,
+    GatewayModeEnum,
+)
 from gpustack import __version__
-from gpustack.config.registration import read_registration_token, read_worker_token
+from gpustack.config.registration import (
+    read_registration_token,
+    read_worker_token,
+    determine_default_registry,
+)
 from gpustack.utils.network import get_first_non_loopback_ip
 from gpustack.utils import platform
 
 _config = None
 
 
-class GatewayModeEnum(str, Enum):
-    auto = "auto"
-    embedded = "embedded"
-    incluster = "incluster"
-    external = "external"
-    disabled = "disabled"
+class WorkerConfig(PredefinedConfig):
+    # common config which should be dynamic or not configurable
+    data_dir: Optional[str] = None
+    advertise_address: Optional[str] = None
+    # Worker options which are different for each worker
+    token: Optional[str] = None
+    server_url: Optional[str] = None
+    worker_ip: Optional[str] = None
+    worker_ifname: Optional[str] = None
+    worker_name: Optional[str] = None
 
 
-class Config(BaseSettings):
+class Config(WorkerConfig, BaseSettings):
     """A class used to define GPUStack configuration.
 
     Attributes:
@@ -76,7 +89,7 @@ class Config(BaseSettings):
 
         token: Shared secret used to register worker.
         server_url: URL of the server.
-        worker_ip: Deprecated, use advertise_address instead.
+        worker_ip: IP address of the worker node. Auto-detected by default.
         worker_ifname: Network interface name of the worker node. Auto-detected by default.
         worker_name: Name of the worker node. Use the hostname by default.
         disable_worker_metrics: Disable worker metrics.
@@ -86,11 +99,12 @@ class Config(BaseSettings):
         ray_port_range: Port range for Ray services(vLLM distributed deployment using), specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '41000-41999'.
         log_dir: Directory to store logs.
         bin_dir: Directory to store additional binaries, e.g., versioned backend executables.
+        benchmark_dir: Directory to store benchmark results.
+        benchmark_max_duration_seconds: Max duration for a benchmark before timeout. Disabled when unset.
         pipx_path: Path to the pipx executable, used to install versioned backends.
         system_reserved: Reserved system resources.
         tools_download_base_url: Base URL to download dependency tools.
         enable_hf_transfer: Speed up file transfers with the huggingface Hub.
-        enable_hf_xet: Using Hugging Face XET for download model files.
         enable_cors: Enable CORS in server.
         allow_origins: A list of origins that should be permitted to make cross-origin requests.
         allow_credentials: Indicate that cookies should be supported for cross-origin requests.
@@ -102,41 +116,31 @@ class Config(BaseSettings):
         image_repo: Repository for the container images.
         service_discovery_name: Name of the service discovery service in DNS. Only useful when deployed in Kubernetes with service discovery.
         gateway_mode: Gateway deployment mode. Options are 'auto', 'embedded', 'incluster', 'external', 'disabled'. Default is 'auto'.
-        gateway_kubeconfig: Path to the kubeconfig file for Gateway. Only used when gateway_mode is 'external'.
-        gateway_concurrency: Number of concurrent connections for the Gateway. Default is 16.
+        gateway_kubeconfig: Path to the kubeconfig file for gateway. Only used when gateway_mode is 'external'.
+        gateway_concurrency: Number of concurrent connections for the embedded gateway. Default is 16.
+        gateway_namespace: The namespace where the gateway component is deployed.
         namespace: Kubernetes namespace for GPUStack to deploy gateway routing rules and model instances.
+        disable_builtin_observability: Disable embedded Grafana and Prometheus services.
+        grafana_url: Base URL for Grafana UI used by redirects and proxying. When unset, defaults to the embedded Grafana URL unless builtin observability is disabled.
+        grafana_worker_dashboard_uid: Grafana dashboard UID for worker dashboard.
+        grafana_model_dashboard_uid: Grafana dashboard UID for model dashboard.
     """
 
-    # Common options
+    # Server options
+    # Deprecated, as we using docker image to run the server, host is not used.
+    host: Optional[str] = None
     # The port and tls_port are used in gateway configuration.
     port: Optional[int] = 80
     tls_port: Optional[int] = 443
     # The api_port is used in gpustack server/worker serving API requests.
     api_port: Optional[int] = 30080
-    advertise_address: Optional[str] = None
-    debug: bool = False
-    data_dir: Optional[str] = None
-    cache_dir: Optional[str] = None
-    huggingface_token: Optional[str] = None
-    system_default_container_registry: Optional[str] = None
-    image_name_override: Optional[str] = None
-    image_repo: str = "gpustack/gpustack"
-    gateway_mode: GatewayModeEnum = GatewayModeEnum.auto
-    gateway_kubeconfig: Optional[str] = None
-    gateway_concurrency: int = 16
-    service_discovery_name: Optional[str] = None
-    namespace: Optional[str] = None
-
-    # Server options
-    # Deprecated, as we using docker image to run the server, host is not used.
-    host: Optional[str] = None
     database_port: Optional[int] = 5432
     database_url: Optional[str] = None
     disable_worker: Optional[bool] = None  # Deprecated
     enable_worker: bool = False
     bootstrap_password: Optional[str] = None
     jwt_secret_key: Optional[str] = None
-    system_reserved: Optional[dict] = None
+    resources: Optional[dict] = None
     ssl_keyfile: Optional[str] = None
     ssl_certfile: Optional[str] = None
     force_auth_localhost: bool = False
@@ -150,7 +154,7 @@ class Config(BaseSettings):
     allow_origins: Optional[List[str]] = ['*']
     allow_credentials: bool = False
     allow_methods: Optional[List[str]] = ['GET', 'POST']
-    allow_headers: Optional[List[str]] = ['Authorization', 'Content-Type']
+    allow_headers: Optional[List[str]] = ['Authorization', 'Content-Type', 'X-API-Key']
     external_auth_type: Optional[str] = None  # external auth type
     external_auth_name: Optional[str] = None  # external auth name
     external_auth_full_name: Optional[str] = None  # external auth full name
@@ -179,29 +183,28 @@ class Config(BaseSettings):
     server_external_url: Optional[str] = None
     # custom post-logout redirection key for compatibility with different IdPs.
     external_auth_post_logout_redirect_key: Optional[str] = None
+    # Number of concurrent connections for the embedded gateway.
+    gateway_concurrency: int = 16
+    disable_builtin_observability: bool = False
+    grafana_url: Optional[str] = None
+    grafana_worker_dashboard_uid: Optional[str] = "gpustack-worker"
+    grafana_model_dashboard_uid: Optional[str] = "gpustack-model"
 
-    # Worker options
-    token: Optional[str] = None
-    server_url: Optional[str] = None
-    worker_ip: Optional[str] = None
-    worker_ifname: Optional[str] = None
-    worker_name: Optional[str] = None
-    disable_worker_metrics: bool = False
-    worker_port: int = 10150
-    worker_metrics_port: int = 10151
-    service_port_range: Optional[str] = "40000-40063"
-    ray_port_range: Optional[str] = "41000-41999"
-    log_dir: Optional[str] = None
-    resources: Optional[dict] = None
-    bin_dir: Optional[str] = None
-    pipx_path: Optional[str] = None
-    tools_download_base_url: Optional[str] = None
-    enable_hf_transfer: bool = False
-    enable_hf_xet: bool = False
-    proxy_mode: Optional[ModelInstanceProxyModeEnum] = None
+    _set_worker_fields = {}
+
+    model_config = SettingsConfigDict(
+        env_prefix="GPUSTACK_", protected_namespaces=('settings_',)
+    )
 
     def __init__(self, **values):
         super().__init__(**values)
+        self._set_worker_fields = self.model_dump(
+            exclude_defaults=True,
+            exclude_unset=True,
+            exclude_none=True,
+            include=self.__pydantic_fields_set__
+            & set(PredefinedConfig.model_fields.keys()),
+        )
 
         def prepare_dir(dir_path: Optional[str], default: str) -> str:
             return default if dir_path is None else os.path.abspath(dir_path)
@@ -213,6 +216,11 @@ class Config(BaseSettings):
         )
         self.bin_dir = prepare_dir(self.bin_dir, os.path.join(self.data_dir, "bin"))
         self.log_dir = prepare_dir(self.log_dir, os.path.join(self.data_dir, "log"))
+        self.benchmark_dir = prepare_dir(
+            self.benchmark_dir, os.path.join(self.data_dir, "benchmarks")
+        )
+        if isinstance(self.grafana_url, str) and not self.grafana_url.strip():
+            self.grafana_url = None
 
         if self.token is None:
             self.token = read_registration_token(self.data_dir)
@@ -251,10 +259,7 @@ class Config(BaseSettings):
 
         # default to worker proxy mode if running as worker
         if self.proxy_mode is None:
-            if self._is_worker():
-                self.proxy_mode = ModelInstanceProxyModeEnum.WORKER
-            else:
-                self.proxy_mode = ModelInstanceProxyModeEnum.DIRECT
+            self.proxy_mode = ModelInstanceProxyModeEnum.WORKER
 
     @model_validator(mode="after")
     def check_all(self):  # noqa: C901
@@ -292,6 +297,13 @@ class Config(BaseSettings):
 
         return self
 
+    def get_grafana_url(self) -> Optional[str]:
+        if self.grafana_url is not None:
+            return self.grafana_url
+        if self.disable_builtin_observability:
+            return None
+        return "http://127.0.0.1:3000"
+
     @staticmethod
     def check_port_range(port_range: str, diff: Optional[int] = None):
         ports = port_range.split("-")
@@ -312,6 +324,7 @@ class Config(BaseSettings):
         os.makedirs(self.cache_dir, exist_ok=True)
         os.makedirs(self.bin_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.benchmark_dir, exist_ok=True)
         # prepare gateway dirs
         os.makedirs(
             os.getenv("GPUSTACK_GATEWAY_DIR", self.higress_base_dir()),
@@ -443,7 +456,7 @@ class Config(BaseSettings):
 
         return system_info
 
-    def get_gpu_devices(self) -> GPUDevicesInfo:  # noqa: C901
+    def get_gpu_devices(self) -> GPUDevicesStatus:  # noqa: C901
         """get gpu devices from resources
         resource example:
         ```yaml
@@ -469,7 +482,7 @@ class Config(BaseSettings):
                   mtu: 8192                # optional
         ```
         """
-        gpu_devices: GPUDevicesInfo = []
+        gpu_devices: GPUDevicesStatus = []
         if not self.resources:
             return None
 
@@ -495,10 +508,10 @@ class Config(BaseSettings):
             if index is None:
                 raise Exception("GPU device index is required")
 
-            vendors = supported_manufacturers()
+            vendors = available_manufacturers()
             if vendor not in vendors:
                 raise Exception(
-                    f"Unsupported GPU device vendor, supported vendors are: {','.join(map(str, vendors))}"
+                    f"Unsupported GPU device vendor, available vendors are: {','.join(map(str, vendors))}"
                 )
 
             if not memory:
@@ -524,14 +537,14 @@ class Config(BaseSettings):
                 if gateway and not validators.ip(gateway):
                     raise Exception("GPU device network gateway is invalid")
 
-            types = supported_backends()
+            types = available_backends()
             if type_ not in types:
                 raise Exception(
-                    f"Unsupported GPU type, supported type are: {','.join(map(str, types))}"
+                    f"Unsupported GPU type, available type are: {','.join(map(str, types))}"
                 )
 
             gpu_devices.append(
-                GPUDeviceInfo(
+                GPUDeviceStatus(
                     index=index,
                     arch_family=arch_family,
                     compute_capability=compute_capability,
@@ -599,10 +612,6 @@ class Config(BaseSettings):
 
         return os.path.abspath(data_dir)
 
-    class Config:
-        env_prefix = "GPUSTACK_"
-        protected_namespaces = ('settings_',)
-
     def prepare_jwt_secret_key(self):
         if self.jwt_secret_key is not None:
             return
@@ -621,16 +630,6 @@ class Config(BaseSettings):
 
     def _is_worker(self):
         return self.server_url is not None
-
-    def get_image_name(self, override: Optional[str] = None) -> str:
-        if self.image_name_override:
-            return self.image_name_override
-        version = __version__
-        if version.removeprefix("v") == "0.0.0":
-            version = "main"
-        registry = override or self.system_default_container_registry
-        prefix = f"{registry}/" if registry else ""
-        return f"{prefix}{self.image_repo}:{version}"
 
     def postgres_base_dir(self) -> str:
         return os.path.join(self.data_dir, "postgresql")
@@ -711,24 +710,14 @@ class Config(BaseSettings):
 
         return True
 
-    def set_async_k8s_config(self, config):
-        if getattr(self, '_k8s_async_config', None) is not None:
-            # ignore setting config if config is set
-            return
-        self._k8s_async_config = config
-
-    def get_async_k8s_config(self):
-        rtn = getattr(self, '_k8s_async_config', None)
-        return rtn
-
     def get_advertise_address(self) -> str:
         return self.advertise_address or get_first_non_loopback_ip()
 
-    def get_gateway_namespace(self) -> str:
-        default_gateway_namespace = "higress-system"
-        if self.gateway_mode == GatewayModeEnum.embedded:
-            return default_gateway_namespace
-        return self.namespace if self.namespace else default_gateway_namespace
+    def get_namespace(self) -> str:
+        # for the embedded gateway, use the gateway namespace
+        if self.gateway_mode in [GatewayModeEnum.embedded, GatewayModeEnum.external]:
+            return self.gateway_namespace
+        return self.namespace
 
     def get_external_hostname(self) -> Optional[str]:
         hostname = None
@@ -778,13 +767,72 @@ class Config(BaseSettings):
             else self.worker_port
         )
 
-    def static_worker_ip(self) -> Optional[str]:
-        return self.worker_ip or self.advertise_address or None
-
     def reload_token(self):
         token = read_registration_token(self.data_dir)
         if token:
             self.token = token
+
+    def reload_worker_config(self, worker_config: Optional[PredefinedConfigNoDefaults]):
+        if worker_config is None:
+            return
+        updated = {
+            **worker_config.model_dump(exclude_none=True),
+            **self._set_worker_fields,
+        }
+        for key, value in updated.items():
+            if key in self.__class__.model_fields:
+                setattr(self, key, value)
+        self.check_all()
+
+    def get_system_reserved(self) -> Dict[str, int]:
+        system_reserved_in_bytes = {**(self.system_reserved or {})}
+        system_reserved_in_bytes["ram"] = (
+            system_reserved_in_bytes.get(
+                "ram", system_reserved_in_bytes.pop("memory", 0)
+            )
+            << 30
+        )
+        system_reserved_in_bytes["vram"] = (
+            system_reserved_in_bytes.get(
+                "vram", system_reserved_in_bytes.pop("gpu_memory", 0)
+            )
+            << 30
+        )
+        return system_reserved_in_bytes
+
+
+def get_image_name(
+    image_name_override: Optional[str],
+    registry: Optional[str] = None,
+    image_repo: str = "gpustack/gpustack",
+) -> str:
+    if image_name_override:
+        return image_name_override
+    version = __version__
+    if version.removeprefix("v") == "0.0.0":
+        version = "dev"
+    prefix = f"{registry}/" if registry else ""
+    return f"{prefix}{image_repo}:{version}"
+
+
+def get_cluster_image_name(worker_config: Optional[PredefinedConfigNoDefaults]) -> str:
+    cfg = get_global_config()
+    if worker_config is None:
+        return get_image_name(
+            image_repo=cfg.image_repo,
+            image_name_override=cfg.image_name_override,
+            registry=determine_default_registry(cfg.system_default_container_registry),
+        )
+    registry = determine_default_registry(
+        worker_config.system_default_container_registry
+        or cfg.system_default_container_registry
+    )
+    return get_image_name(
+        image_name_override=worker_config.image_name_override
+        or cfg.image_name_override,
+        image_repo=worker_config.image_repo or cfg.image_repo,
+        registry=registry,
+    )
 
 
 def get_openid_configuration(issuer: str) -> dict:

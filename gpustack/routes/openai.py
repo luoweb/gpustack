@@ -1,3 +1,5 @@
+import re
+import random
 import asyncio
 from typing import AsyncGenerator, List, Optional, Tuple
 import aiohttp
@@ -18,20 +20,27 @@ from gpustack.api.exceptions import (
     OpenAIAPIErrorResponse,
     ServiceUnavailableException,
     GatewayTimeoutException,
-    ForbiddenException,
 )
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack import envs
 from gpustack.http_proxy.load_balancer import LoadBalancer
-from gpustack.routes.models import build_category_conditions
+from gpustack.routes.model_common import build_category_conditions
 from gpustack.schemas.models import (
     BackendEnum,
     Model,
+)
+from gpustack.schemas.model_routes import (
+    ModelRoute,
     MyModel,
 )
-from gpustack.server.db import get_engine
 from gpustack.server.deps import SessionDep, CurrentUserDep
-from gpustack.server.services import ModelInstanceService, ModelService, WorkerService
+from gpustack.server.services import (
+    ModelInstanceService,
+    ModelRouteService,
+    WorkerService,
+    UserService,
+)
+from gpustack.utils.network import use_proxy_env_for_url
 
 
 logger = logging.getLogger(__name__)
@@ -40,41 +49,6 @@ load_balancer = LoadBalancer()
 
 
 router = APIRouter()
-
-
-@router.post("/chat/completions")
-async def chat_completions(request: Request):
-    return await proxy_request_by_model(request, "chat/completions")
-
-
-@router.post("/completions")
-async def completions(request: Request):
-    return await proxy_request_by_model(request, "completions")
-
-
-@router.post("/embeddings")
-async def embeddings(request: Request):
-    return await proxy_request_by_model(request, "embeddings")
-
-
-@router.post("/images/generations")
-async def images_generations(request: Request):
-    return await proxy_request_by_model(request, "images/generations")
-
-
-@router.post("/images/edits")
-async def images_edits(request: Request):
-    return await proxy_request_by_model(request, "images/edits")
-
-
-@router.post("/audio/speech")
-async def audio_speech(request: Request):
-    return await proxy_request_by_model(request, "audio/speech")
-
-
-@router.post("/audio/transcriptions")
-async def audio_transcriptions(request: Request):
-    return await proxy_request_by_model(request, "audio/transcriptions")
 
 
 @router.get("/models")
@@ -90,8 +64,8 @@ async def list_models(
         description="Include model meta information.",
     ),
 ):
-    target_class = Model if user.is_admin else MyModel
-    statement = select(target_class).where(target_class.ready_replicas > 0)
+    target_class = ModelRoute if user.is_admin else MyModel
+    statement = select(target_class).where(target_class.ready_targets > 0)
     if target_class == MyModel:
         # Non-admin users should only see their own private models when filtering by categories.
         statement = statement.where(target_class.user_id == user.id)
@@ -115,39 +89,55 @@ async def list_models(
     return result
 
 
-async def proxy_request_by_model(request: Request, endpoint: str):
+@router.post("/completions")
+@router.post("/chat/completions")
+@router.post("/responses")
+@router.post("/embeddings")
+@router.post("/images/generations")
+@router.post("/images/edits")
+@router.post("/audio/speech")
+@router.post("/audio/transcriptions")
+async def proxy_request_by_model(
+    request: Request,
+    user: CurrentUserDep,
+    session: SessionDep,
+):
+    endpoint = re.sub(r"^/(v1|v1-openai)/", "", request.url.path)
     """
     Proxy the request to the model instance that is running the model specified in the
     request body.
     """
-    allowed_model_names = getattr(request.state, "user_allow_model_names", set())
     model_name, stream, body_json, form_data = await parse_request_body(request)
-    if model_name not in allowed_model_names:
-        raise ForbiddenException(
+    if not await UserService(session).model_allowed_for_user(
+        model_name=model_name,
+        user_id=user.id,
+        api_key=getattr(request.state, "api_key", None),
+    ):
+        raise NotFoundException(
             message="Model not found",
             is_openai_exception=True,
         )
-    async with AsyncSession(get_engine()) as session:
-        model = await ModelService(session).get_by_name(model_name)
+    models: List[Model] = await ModelRouteService(
+        session
+    ).get_model_ids_by_model_route_name(model_name)
+    if len(models) == 0:
+        raise NotFoundException(
+            message="Model not found or no running instances available",
+            is_openai_exception=True,
+        )
+    request.state.stream = stream
+    model = random.choice(models)
+    request.state.model = model
 
-        if not model:
-            raise NotFoundException(
-                message="Model not found",
-                is_openai_exception=True,
-            )
+    mutate_request(request, model_name, body_json, form_data)
 
-        request.state.model = model
-        request.state.stream = stream
-
-        mutate_request(request, body_json, form_data)
-
-        instance = await get_running_instance(session, model.id)
-        worker = await WorkerService(session).get_by_id(instance.worker_id)
-        if not worker:
-            raise InternalServerErrorException(
-                message=f"Worker with ID {instance.worker_id} not found",
-                is_openai_exception=True,
-            )
+    instance = await get_running_instance(session, model.id)
+    worker = await WorkerService(session).get_by_id(instance.worker_id)
+    if not worker:
+        raise InternalServerErrorException(
+            message=f"Worker with ID {instance.worker_id} not found",
+            is_openai_exception=True,
+        )
 
     url = f"http://{instance.worker_ip}:{worker.port}/proxy/v1/{endpoint}"
     token = worker.token
@@ -298,7 +288,12 @@ async def handle_streaming_request(
 
     async def stream_generator():
         try:
-            http_client: aiohttp.ClientSession = request.app.state.http_client
+            use_proxy_env = use_proxy_env_for_url(url)
+            http_client: aiohttp.ClientSession = (
+                request.app.state.http_client
+                if use_proxy_env
+                else request.app.state.http_client_no_proxy
+            )
             async with http_client.request(
                 method=request.method,
                 url=url,
@@ -348,7 +343,12 @@ async def handle_standard_request(
     if extra_headers:
         headers.update(extra_headers)
 
-    http_client: aiohttp.ClientSession = request.app.state.http_client
+    use_proxy_env = use_proxy_env_for_url(url)
+    http_client: aiohttp.ClientSession = (
+        request.app.state.http_client
+        if use_proxy_env
+        else request.app.state.http_client_no_proxy
+    )
     timeout = aiohttp.ClientTimeout(total=envs.PROXY_TIMEOUT)
     async with http_client.request(
         method=request.method,
@@ -391,7 +391,10 @@ async def get_running_instance(session: AsyncSession, model_id: int):
 
 
 def mutate_request(
-    request: Request, body_json: Optional[dict], form_data: Optional[aiohttp.FormData]
+    request: Request,
+    model_name: str,
+    body_json: Optional[dict],
+    form_data: Optional[aiohttp.FormData],
 ):
     path = request.url.path
     model: Model = request.state.model
@@ -402,6 +405,11 @@ def mutate_request(
         and model.env.get("GPUSTACK_APPLY_QWEN3_RERANKER_TEMPLATES", False)
     ):
         apply_qwen3_reranker_templates(body_json)
+    if model_name != model.name:
+        if body_json is not None:
+            body_json["model"] = model.name
+        elif form_data is not None:
+            form_data.add_field("model", model.name)
 
 
 def apply_qwen3_reranker_templates(body_json: dict):

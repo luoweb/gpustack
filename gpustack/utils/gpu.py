@@ -2,7 +2,8 @@ import re
 
 from typing import Tuple, Union, List, Callable
 
-from gpustack.schemas.workers import GPUDeviceInfo, WorkerBase
+from gpustack.schemas.benchmark import GPUSnapshots
+from gpustack.schemas.workers import GPUDeviceStatus, WorkerBase
 
 pattern = r"^(?P<worker_name>.+):(?P<device>[^:]+):(?P<gpu_index>\d+)$"
 
@@ -27,7 +28,14 @@ def parse_gpu_id(input: str) -> Tuple[bool, dict]:
     return False, None
 
 
-def parse_gpu_ids_by_worker(gpu_ids: list) -> dict:
+def make_gpu_id(worker_name: str, device: str, gpu_index: int) -> str:
+    """
+    Generate gpu_id, format: worker_name:device:gpu_index
+    """
+    return f"{worker_name}:{device}:{gpu_index}"
+
+
+def group_gpu_ids_by_worker(gpu_ids: list) -> dict:
     """
     Group GPU IDs by worker name.
 
@@ -54,8 +62,33 @@ def parse_gpu_ids_by_worker(gpu_ids: list) -> dict:
     return worker_gpu_ids
 
 
+def group_gpu_indexes_by_gpu_type_and_worker(gpu_ids: list) -> dict:
+    """
+    Group GPU indexes by gpu type and worker name.
+    Args:
+        gpu_ids (list): List of GPU IDs.
+    Returns:
+        dict: {gpu_type: {worker: [gpu_index, ...]}}
+    """
+    result = {}
+    for gpu_id in gpu_ids:
+        is_valid, matched = parse_gpu_id(gpu_id)
+        if not is_valid:
+            raise ValueError(f"Invalid GPU ID: {gpu_id}")
+        worker = matched["worker_name"]
+        gpu_type = matched["device"]
+        gpu_index = int(matched["gpu_index"])
+        result.setdefault(gpu_type, {}).setdefault(worker, []).append(gpu_index)
+    # Sort indexes for each type/worker
+    return {
+        t: {w: sorted(idx) for w, idx in workers.items()}
+        for t, workers in result.items()
+    }
+
+
 def all_gpu_match(
-    worker: Union[List[WorkerBase], WorkerBase], verify: Callable[[GPUDeviceInfo], bool]
+    worker: Union[List[WorkerBase], WorkerBase],
+    verify: Callable[[GPUDeviceStatus], bool],
 ) -> bool:
     """
     Check if all GPUs in the worker match the given callable condition.
@@ -67,6 +100,9 @@ def all_gpu_match(
     Returns:
         bool: True if all GPUs match the condition, False otherwise.
     """
+    if not worker:
+        return False
+
     if isinstance(worker, list):
         return all(all_gpu_match(w, verify) for w in worker)
 
@@ -76,7 +112,8 @@ def all_gpu_match(
 
 
 def any_gpu_match(
-    worker: Union[List[WorkerBase], WorkerBase], verify: Callable[[GPUDeviceInfo], bool]
+    worker: Union[List[WorkerBase], WorkerBase],
+    verify: Callable[[GPUDeviceStatus], bool],
 ) -> bool:
     """
     Check if any GPU in the worker matches the given callable condition.
@@ -94,6 +131,91 @@ def any_gpu_match(
     if not worker.status or not worker.status.gpu_devices:
         return False
     return any(verify(gpu) for gpu in worker.status.gpu_devices)
+
+
+def find_one_gpu(
+    worker: Union[List[WorkerBase], WorkerBase]
+) -> Union[GPUDeviceStatus, None]:
+    if isinstance(worker, list):
+        for w in worker:
+            gpu = find_one_gpu(w)
+            if gpu is not None:
+                return gpu
+    elif worker.status and worker.status.gpu_devices:
+        return worker.status.gpu_devices[0]
+
+    return None
+
+
+def compare_compute_capability(current: str | None, target: str | None) -> int:
+    """
+    Safely compares two CUDA compute capability version strings.
+
+    Args:
+        current: The compute capability of the current device (e.g., "7.5").
+                 Accepts None, empty, or whitespace-only strings as invalid.
+        target:  The required or reference compute capability (e.g., "8.0").
+                 Also accepts None or invalid strings.
+
+    Returns:
+        -1 if `current` is less than `target`,
+         0 if they are equal (including both being invalid),
+         1 if `current` is greater than `target`.
+
+    Invalid inputs (None, empty, whitespace, or malformed "X.Y" format)
+    are treated as the lowest possible version. Thus:
+      - Any valid version > any invalid version.
+      - Two invalid versions are considered equal.
+    """
+
+    def parse_cc(cc: str | None) -> tuple[int, int] | None:
+        """Parse a compute capability string into (major, minor) integers."""
+        if cc is None:
+            return None
+        cc = cc.strip()
+        if not cc:
+            return None
+        parts = cc.split('.', 1)
+        if len(parts) != 2:
+            return None
+        try:
+            major = int(parts[0])
+            minor = int(parts[1])
+            # Compute Capability versions are non-negative
+            if major < 0 or minor < 0:
+                return None
+            return major, minor
+        except (ValueError, TypeError):
+            return None
+
+    cur_parsed = parse_cc(current)
+    tgt_parsed = parse_cc(target)
+
+    # Both invalid → considered equal
+    if cur_parsed is None and tgt_parsed is None:
+        return 0
+    # Current is invalid, target is valid → current < target
+    if cur_parsed is None:
+        return -1
+    # Target is invalid, current is valid → current > target
+    if tgt_parsed is None:
+        return 1
+
+    # Both are valid: compare numerically
+    cur_major, cur_minor = cur_parsed
+    tgt_major, tgt_minor = tgt_parsed
+
+    if cur_major > tgt_major:
+        return 1
+    elif cur_major < tgt_major:
+        return -1
+    else:
+        if cur_minor > tgt_minor:
+            return 1
+        elif cur_minor < tgt_minor:
+            return -1
+        else:
+            return 0
 
 
 def abbreviate_gpu_indexes(indexes, max_show=3):
@@ -122,3 +244,24 @@ def abbreviate_worker_gpu_indexes(
         msg += f" and {other_gpu_count} {'GPUs' if other_gpu_count > 1 else 'GPU'}"
         msg += f" from other {other_worker_count} {'workers' if other_worker_count > 1 else 'worker'}"
     return msg
+
+
+def summary_gpu_snapshots(gpu_snapshots: GPUSnapshots) -> Tuple[str, str]:
+    """Return a summary string of GPU snapshots."""
+    if not gpu_snapshots:
+        return "No GPUs", "No GPUs"
+
+    gpu_groups = {}
+    gpu_vendors = []
+    for _, gpu in gpu_snapshots.items():
+        if gpu.name not in gpu_groups:
+            gpu_groups[gpu.name] = 0
+        gpu_groups[gpu.name] += 1
+        gpu_vendors.append(gpu.vendor)
+
+    sorted_groups = sorted(gpu_groups.items(), key=lambda x: -x[1])
+    gpu_summary = "; ".join(
+        f"{name}" if count == 1 else f"{name}x{count}" for name, count in sorted_groups
+    )
+    gpu_vendor_summary = ", ".join(sorted(set(gpu_vendors)))
+    return gpu_summary, gpu_vendor_summary

@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from gpustack.api.exceptions import (
@@ -8,11 +8,13 @@ from gpustack.api.exceptions import (
     ConflictException,
 )
 from gpustack.security import get_secret_hash
-from gpustack.server.deps import CurrentUserDep, ListParamsDep, SessionDep, EngineDep
+from gpustack.server.db import async_session
+from gpustack.server.deps import CurrentUserDep, SessionDep
 from gpustack.schemas.users import (
     User,
     UserActivationUpdate,
     UserCreate,
+    UserListParams,
     UserUpdate,
     UserPublic,
     UsersPublic,
@@ -25,7 +27,8 @@ router = APIRouter()
 
 @router.get("", response_model=UsersPublic)
 async def get_users(
-    engine: EngineDep, session: SessionDep, params: ListParamsDep, search: str = None
+    params: UserListParams = Depends(),
+    search: str = None,
 ):
     fuzzy_fields = {}
     if search:
@@ -33,20 +36,22 @@ async def get_users(
 
     if params.watch:
         return StreamingResponse(
-            User.streaming(engine, fuzzy_fields=fuzzy_fields),
+            User.streaming(fuzzy_fields=fuzzy_fields),
             media_type="text/event-stream",
         )
 
-    return await User.paginated_by_query(
-        session=session,
-        fuzzy_fields=fuzzy_fields,
-        page=params.page,
-        per_page=params.perPage,
-        fields={
-            "deleted_at": None,
-            "is_system": False,
-        },
-    )
+    async with async_session() as session:
+        return await User.paginated_by_query(
+            session=session,
+            fuzzy_fields=fuzzy_fields,
+            page=params.page,
+            per_page=params.perPage,
+            fields={
+                "deleted_at": None,
+                "is_system": False,
+            },
+            order_by=params.order_by,
+        )
 
 
 @router.get("/{id}", response_model=UserPublic)

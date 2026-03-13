@@ -2,8 +2,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 import logging
-from typing import Dict, List, Optional
+from typing import List, Optional
 
+from gpustack import envs
 from gpustack.policies.base import (
     Allocatable,
     ModelInstanceScheduleCandidate,
@@ -22,31 +23,41 @@ from gpustack.schemas.models import (
     PlacementStrategyEnum,
 )
 from gpustack.schemas.workers import Worker
-from gpustack.server.db import get_engine
-from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlalchemy.ext.asyncio import AsyncEngine
-
-MaxScore = 100
+from gpustack.server.db import async_session
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ResourceWeight:
-    vram: int = 2
-    ram: int = 1
+    vram: float = 2.0
+    ram: float = 1.0
 
 
 @dataclass
 class ModelWeight:
-    current: int = 1
-    others: int = 0.2
+    current: float = 1.0
+    others: float = 0.2
 
 
 @dataclass
 class InferenceServerTypeWeight:
-    server: int = 5
-    rpc_server: int = 1  # max rpc server count is 3
+    server: float = 5.0
+    rpc_server: float = 1.0  # max rpc server count is 3
+
+
+@dataclass
+class SpreadScoreWeights:
+    worker_weight: float = 0.85
+    gpu_weight: float = 0.15
+    zero_current_base_score: float = 0.85
+    zero_current_others_weight: float = 0.15
+    has_both_base_score: float = 0.45
+    has_both_current_weight: float = 0.35
+    has_both_others_weight: float = 0.20
+    all_have_current_base_score: float = 0.50
+    all_have_current_weight: float = 0.25
+    all_have_others_weight: float = 0.15
 
 
 class ScaleTypeEnum(str, Enum):
@@ -58,14 +69,28 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
     def __init__(
         self,
         model: Model,
+        model_instances: List[ModelInstance],
         scale_type: ScaleTypeEnum = ScaleTypeEnum.SCALE_UP,
+        resource_weight: Optional[ResourceWeight] = None,
+        model_weight: Optional[ModelWeight] = None,
+        inference_server_type_weight: Optional[InferenceServerTypeWeight] = None,
+        spread_score_weights: Optional[SpreadScoreWeights] = None,
+        max_score: Optional[float] = None,
     ):
-        self._engine = get_engine()
         self._model = model
-        self._resource_weight = ResourceWeight()
-        self._model_weight = ModelWeight()
-        self._inference_server_type_weight = InferenceServerTypeWeight()
+        self._model_instances = model_instances
+        self._resource_weight = resource_weight or ResourceWeight()
+        self._model_weight = model_weight or ModelWeight()
+        self._inference_server_type_weight = (
+            inference_server_type_weight or InferenceServerTypeWeight()
+        )
+        self._spread_score_weights = spread_score_weights or SpreadScoreWeights()
         self._scale_type = scale_type
+        self._max_score = (
+            envs.SCHEDULER_SCALE_UP_PLACEMENT_MAX_SCORE
+            if max_score is None
+            else max_score
+        )
 
     async def score(
         self, candidates: List[ModelInstanceScheduleCandidate]
@@ -98,7 +123,7 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             f"model {self._model.name}, score instances with {self._scale_type} placement policy"
         )
 
-        async with AsyncSession(self._engine) as session:
+        async with async_session() as session:
             workers = await Worker.all(session)
             worker_map = {worker.id: worker for worker in workers}
 
@@ -118,8 +143,8 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         Score the candidates with the binpack strategy.
         """
         for candidate in candidates:
-            allocatable = await get_worker_allocatable_resource(
-                self._engine, candidate.worker
+            allocatable = get_worker_allocatable_resource(
+                self._model_instances, candidate.worker
             )
 
             final_score = 0
@@ -166,8 +191,13 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
                 continue
 
             worker = worker_map.get(instance.worker_id)
+            if worker is None:
+                scored_instances.append(
+                    ModelInstanceScore(model_instance=instance, score=0)
+                )
+                continue
 
-            allocatable = await get_worker_allocatable_resource(self._engine, worker)
+            allocatable = get_worker_allocatable_resource(self._model_instances, worker)
 
             final_score = 0
             score = await self._score_binpack_item(
@@ -212,12 +242,17 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         Score the candidates with the spread strategy.
         """
         worker_model_instances_count_map = await self._get_worker_model_instance_count()
+        workers = [candidate.worker for candidate in candidates if candidate.worker]
+        spread_stats = self._build_spread_stats(
+            worker_model_instances_count_map, workers
+        )
 
         for candidate in candidates:
             candidate.score = await self._score_spread_item(
                 candidate.gpu_indexes,
                 candidate.worker,
                 worker_model_instances_count_map,
+                spread_stats,
             )
 
         return candidates
@@ -229,6 +264,9 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         Score the candidates with the spread strategy.
         """
         worker_model_instances_count_map = await self._get_worker_model_instance_count()
+        spread_stats = self._build_spread_stats(
+            worker_model_instances_count_map, worker_map.values()
+        )
 
         scored_instances = []
         for instance in instances:
@@ -240,7 +278,10 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
 
             worker = worker_map.get(instance.worker_id)
             score = await self._score_spread_item(
-                instance.gpu_indexes, worker, worker_model_instances_count_map
+                instance.gpu_indexes,
+                worker,
+                worker_model_instances_count_map,
+                spread_stats,
             )
             scored_instances.append(
                 ModelInstanceScore(model_instance=instance, score=score)
@@ -253,28 +294,27 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         instance_gpu_indexes: List[int],
         worker: Worker,
         worker_model_instances_count_map: dict,
-    ) -> int:
+        spread_stats: dict,
+    ) -> float:
         """
         Score the candidates with the spread strategy.
         """
 
-        instance_worker_id = worker.id
-        # level 1: max score, no model instances
-        if instance_worker_id not in worker_model_instances_count_map:
-            return MaxScore
+        if worker is None:
+            return 0
 
-        instance_count_map = worker_model_instances_count_map.get(
-            instance_worker_id, {}
+        instance_count_map = self._get_instance_count_map(
+            worker_model_instances_count_map, worker.id
         )
 
         if instance_gpu_indexes is not None and len(instance_gpu_indexes) > 0:
             return await self._score_spread_gpu(
                 instance_count_map,
-                worker,
                 instance_gpu_indexes,
+                spread_stats,
             )
         else:
-            return await self._score_spread_cpu(instance_count_map.get("total", {}))
+            return await self._score_spread_cpu(instance_count_map, spread_stats)
 
     async def _score_binpack_item(  # noqa: C901
         self,
@@ -282,70 +322,67 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         computed_resource_claim: ComputedResourceClaim,
         allocatable: Allocatable,
         scale_type: str,
-    ) -> int:
+    ) -> float:
         score = 0
         gpu_count = len(gpu_indexes) if gpu_indexes else 0
 
         def calculate_score(
             ram_claim: Optional[int],
             ram_allocatable: Optional[int],
-            vram_claim: Dict[int, int],
-            vram_allocatable: Dict[int, int],
+            vram_claim: Optional[int],
+            vram_allocatable: Optional[int],
         ):
             if ram_claim is None or ram_allocatable is None or ram_allocatable == 0:
                 ram_score = 0
             else:
                 ram_score = (
-                    ram_claim / ram_allocatable * MaxScore * self._resource_weight.ram
+                    ram_claim
+                    / ram_allocatable
+                    * self._max_score
+                    * self._resource_weight.ram
                 )
 
-            vram_score = (
-                vram_claim / vram_allocatable * MaxScore * self._resource_weight.vram
-            )
+            if vram_claim is None or vram_allocatable is None or vram_allocatable == 0:
+                vram_score = 0
+            else:
+                vram_score = (
+                    vram_claim
+                    / vram_allocatable
+                    * self._max_score
+                    * self._resource_weight.vram
+                )
             return (ram_score + vram_score) / (
                 self._resource_weight.ram + self._resource_weight.vram
             )
 
         if gpu_count == 0:
+            # computed_resource_claim.ram must have value when running cpu only model instance
             if scale_type == ScaleTypeEnum.SCALE_UP:
-                score = computed_resource_claim.ram / allocatable.ram * MaxScore
+                score = computed_resource_claim.ram / allocatable.ram * self._max_score
             elif scale_type == ScaleTypeEnum.SCALE_DOWN:
                 score = (
                     computed_resource_claim.ram
                     / (allocatable.ram + computed_resource_claim.ram)
-                    * MaxScore
+                    * self._max_score
                 )
-        elif gpu_count == 1:
-            if scale_type == ScaleTypeEnum.SCALE_UP:
-                score = calculate_score(
-                    computed_resource_claim.ram,
-                    allocatable.ram,
-                    computed_resource_claim.vram[gpu_indexes[0]],
-                    allocatable.vram[gpu_indexes[0]],
-                )
-            elif scale_type == ScaleTypeEnum.SCALE_DOWN:
-                score = calculate_score(
-                    computed_resource_claim.ram,
-                    allocatable.ram + computed_resource_claim.ram,
-                    computed_resource_claim.vram[gpu_indexes[0]],
-                    allocatable.vram[gpu_indexes[0]]
-                    + computed_resource_claim.vram[gpu_indexes[0]],
-                )
-        else:
+        elif gpu_count > 0:
             for i in gpu_indexes:
+                vram_claim = (computed_resource_claim.vram or {}).get(i, 0)
+                allocatable_vram = (allocatable.vram or {}).get(i, 0)
+                result = 0
                 if scale_type == ScaleTypeEnum.SCALE_UP:
                     result = calculate_score(
                         computed_resource_claim.ram,
                         allocatable.ram,
-                        computed_resource_claim.vram[i],
-                        allocatable.vram[i],
+                        vram_claim,
+                        allocatable_vram,
                     )
                 elif scale_type == ScaleTypeEnum.SCALE_DOWN:
                     result = calculate_score(
                         computed_resource_claim.ram,
-                        allocatable.ram + computed_resource_claim.ram,
-                        computed_resource_claim.vram[i],
-                        allocatable.vram[i] + computed_resource_claim.vram[i],
+                        allocatable.ram + (computed_resource_claim.ram or 0),
+                        vram_claim,
+                        allocatable_vram + vram_claim,
                     )
                 if result > score:
                     score = result
@@ -355,121 +392,127 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
     async def _score_spread_gpu(
         self,
         instance_count_map: dict,
-        worker: Worker,
         instance_gpu_indexes: List[int],
-    ) -> int:
-        score = 0
-        worker_current_model_instance_count = instance_count_map.get("total", {}).get(
-            "current", 0
-        )
-        worker_other_model_instance_count = instance_count_map.get("total", {}).get(
-            "others", 0
-        )
+        spread_stats: dict,
+    ) -> float:
+        worker_score = self._score_spread_worker_score(instance_count_map, spread_stats)
 
-        worker_gpu_count = len(worker.status.gpu_devices)
-        each_gpu_max_score = 10 / (worker_gpu_count + 1)
         gpu_map = instance_count_map.get("gpu", {})
-
-        if (
-            worker_current_model_instance_count == 0
-            and worker_other_model_instance_count == 0
-        ):
-            score = MaxScore
-
-        elif (
-            worker_current_model_instance_count == 0
-            and worker_other_model_instance_count > 0
-        ):
-            # level 2: 90 < score < 100, only have other model's instances
-            score = 90
-
-            for gpu_index in instance_gpu_indexes:
-                if gpu_index not in gpu_map:
-                    score += each_gpu_max_score / 1
-                    continue
-                count = gpu_map.get(gpu_index, {}).get("others", 0)
-                score += each_gpu_max_score / (count + 1)
-
-        elif (
-            worker_current_model_instance_count > 0
-            and worker_other_model_instance_count == 0
-        ):
-            # level 3: 80 < score < 90, only have current model's instances
-            score = 80
-
-            for gpu_index in instance_gpu_indexes:
-                if gpu_index not in gpu_map:
-                    score += each_gpu_max_score / 1
-                    continue
-                count = gpu_map.get(gpu_index, {}).get("current", 0)
-                score += each_gpu_max_score / (count + 1)
-
-        else:
-            # level 4: 70 < score < 80, have both current model's instances and other model's instances
-            score = 70
-
-            for gpu_index in instance_gpu_indexes:
-                if gpu_index not in gpu_map:
-                    score += each_gpu_max_score / 1
-                    continue
-                current_count = gpu_map.get(gpu_index, {}).get("current", 0)
-                others_count = gpu_map.get(gpu_index, {}).get("others", 0)
-                score += each_gpu_max_score / (
-                    (current_count + 1) + (others_count + 1) * self._model_weight.others
-                )
-
-        return score
-
-    async def _score_spread_cpu(self, instance_count_map: dict) -> int:
-        worker_current_model_instance_count = instance_count_map.get("current", 0)
-
-        worker_others_model_instance_count = instance_count_map.get("others", 0)
-
-        score = 0
-        if (
-            worker_current_model_instance_count == 0
-            and worker_others_model_instance_count == 0
-        ):
-            # level 1: max score, no model instances
-            score = MaxScore
-        elif (
-            worker_current_model_instance_count == 0
-            and worker_others_model_instance_count > 0
-        ):
-            # level 2: 90 < score < 100, only have other model's instances
-            score = 10 / (worker_others_model_instance_count + 1)
-            score += 90
-        elif (
-            worker_current_model_instance_count > 0
-            and worker_others_model_instance_count == 0
-        ):
-            # level 3: 80 < score < 90, only have current model's instances
-            score = 10 / (worker_current_model_instance_count + 1)
-            score += 80
-        else:
-            # level 4: 70 < score < 80, have both current model's instances and other model's instances
-            score = 10 / (
-                (worker_current_model_instance_count + 1)
-                + (worker_others_model_instance_count + 1) * self._model_weight.others
+        per_gpu_scores = []
+        for gpu_index in instance_gpu_indexes:
+            gpu_count_map = gpu_map.get(gpu_index, {})
+            current_count = gpu_count_map.get("current", 0)
+            others_count = gpu_count_map.get("others", 0)
+            per_gpu_scores.append(
+                1 / (1 + current_count + others_count * self._model_weight.others)
             )
-            score += 70
 
-        return score
+        gpu_score = sum(per_gpu_scores) / len(per_gpu_scores) if per_gpu_scores else 1
+        gpu_score = gpu_score * self._max_score
+
+        return (
+            worker_score * self._spread_score_weights.worker_weight
+            + gpu_score * self._spread_score_weights.gpu_weight
+        )
+
+    async def _score_spread_cpu(
+        self, instance_count_map: dict, spread_stats: dict
+    ) -> float:
+        return self._score_spread_worker_score(instance_count_map, spread_stats)
+
+    def _score_spread_worker_score(
+        self, instance_count_map: dict, spread_stats: dict
+    ) -> float:
+        totals = instance_count_map.get("total", {})
+        current_count = totals.get("current", 0)
+        others_count = totals.get("others", 0)
+
+        any_zero_current = spread_stats.get("any_zero_current", False)
+        min_current = spread_stats.get("min_current", 0)
+        max_current = spread_stats.get("max_current", 0)
+        min_others = spread_stats.get("min_others", 0)
+        max_others = spread_stats.get("max_others", 0)
+
+        if any_zero_current:
+            if current_count == 0:
+                score = (
+                    self._spread_score_weights.zero_current_base_score
+                    + self._spread_score_weights.zero_current_others_weight
+                    * inverse_norm(others_count, min_others, max_others)
+                )
+            else:
+                score = (
+                    self._spread_score_weights.has_both_base_score
+                    + self._spread_score_weights.has_both_current_weight
+                    * inverse_norm(current_count, min_current, max_current)
+                    + self._spread_score_weights.has_both_others_weight
+                    * inverse_norm(others_count, min_others, max_others)
+                )
+        else:
+            score = (
+                self._spread_score_weights.all_have_current_base_score
+                + self._spread_score_weights.all_have_current_weight
+                * inverse_norm(current_count, min_current, max_current)
+                + self._spread_score_weights.all_have_others_weight
+                * inverse_norm(others_count, min_others, max_others)
+            )
+
+        return score * self._max_score
+
+    def _build_spread_stats(self, worker_model_instances_count_map, workers) -> dict:
+        totals = []
+        for worker in workers:
+            if worker is None:
+                continue
+            instance_count_map = self._get_instance_count_map(
+                worker_model_instances_count_map, worker.id
+            )
+            total_map = instance_count_map.get("total", {})
+            totals.append((total_map.get("current", 0), total_map.get("others", 0)))
+
+        if not totals:
+            return {
+                "any_zero_current": True,
+                "min_current": 0,
+                "max_current": 0,
+                "min_others": 0,
+                "max_others": 0,
+            }
+
+        current_counts = [current for current, _ in totals]
+        others_counts = [others for _, others in totals]
+
+        return {
+            "any_zero_current": any(current == 0 for current in current_counts),
+            "min_current": min(current_counts),
+            "max_current": max(current_counts),
+            "min_others": min(others_counts),
+            "max_others": max(others_counts),
+        }
+
+    def _get_instance_count_map(self, worker_model_instances_count_map, worker_id):
+        return worker_model_instances_count_map.get(
+            worker_id,
+            {
+                "total": {"current": 0, "others": 0},
+                "gpu": {},
+            },
+        )
 
     async def _score_binpack_subordinate_workers(
         self, subordinate_workers: List[ModelInstanceSubordinateWorker], scale_type: str
-    ) -> int:
+    ) -> float:
         if subordinate_workers is None:
             return 0
 
-        async with AsyncSession(self._engine) as session:
+        async with async_session() as session:
             workers = await Worker.all(session)
             worker_map = {worker.id: worker for worker in workers}
 
             score = 0
             for subordinate_worker in subordinate_workers:
-                allocatable = await get_worker_allocatable_resource(
-                    self._engine,
+                allocatable = get_worker_allocatable_resource(
+                    self._model_instances,
                     worker_map.get(subordinate_worker.worker_id),
                 )
 
@@ -511,7 +554,6 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             return {}
 
         model_id = self._model.id
-        model_instances = await get_model_instances(self._engine)
 
         worker_model_instances_count_map = defaultdict(
             lambda: {
@@ -520,7 +562,7 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             }
         )
 
-        for model_instance in model_instances:
+        for model_instance in self._model_instances:
             if model_instance.worker_id is None:
                 continue
 
@@ -570,7 +612,18 @@ def update_count(
     worker_model_instances_count_map[worker_id]["total"][key] += 1
 
 
-async def get_model_instances(engine: AsyncEngine) -> List[ModelInstance]:
-    async with AsyncSession(engine) as session:
-        model_instances = await ModelInstance.all(session)
-        return model_instances
+def inverse_norm(value: int, min_value: int, max_value: int) -> float:
+    """
+    Inverse normalize a value into [0, 1] where smaller is better.
+
+    Example:
+        min=0, max=4:
+        value=0 -> 1.0
+        value=1 -> 0.75
+        value=2 -> 0.5
+        value=4 -> 0.0
+    """
+
+    if max_value <= min_value:
+        return 1.0
+    return 1.0 - (value - min_value) / (max_value - min_value)

@@ -1,12 +1,14 @@
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import selectinload
 
 from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
     ForbiddenException,
 )
-from gpustack.server.deps import ListParamsDep, SessionDep, EngineDep
+from gpustack.server.db import async_session
+from gpustack.server.deps import ListParamsDep, SessionDep
 from gpustack.schemas.clusters import (
     WorkerPoolPublic,
     WorkerPoolsPublic,
@@ -14,13 +16,13 @@ from gpustack.schemas.clusters import (
     WorkerPool,
 )
 
+WORKER_POOL_LOAD_OPTIONS = [selectinload(WorkerPool.pool_workers)]
+
 router = APIRouter()
 
 
 @router.get("", response_model=WorkerPoolsPublic)
 async def list(
-    engine: EngineDep,
-    session: SessionDep,
     params: ListParamsDep,
     name: str = None,
     search: str = None,
@@ -40,22 +42,28 @@ async def list(
 
     if params.watch:
         return StreamingResponse(
-            WorkerPool.streaming(engine, fields=fields, fuzzy_fields=fuzzy_fields),
+            WorkerPool.streaming(
+                fields=fields,
+                fuzzy_fields=fuzzy_fields,
+                options=WORKER_POOL_LOAD_OPTIONS,
+            ),
             media_type="text/event-stream",
         )
 
-    return await WorkerPool.paginated_by_query(
-        session=session,
-        fields=fields,
-        fuzzy_fields=fuzzy_fields,
-        page=params.page,
-        per_page=params.perPage,
-    )
+    async with async_session() as session:
+        return await WorkerPool.paginated_by_query(
+            session=session,
+            fields=fields,
+            fuzzy_fields=fuzzy_fields,
+            page=params.page,
+            per_page=params.perPage,
+            options=WORKER_POOL_LOAD_OPTIONS,
+        )
 
 
 @router.get("/{id}", response_model=WorkerPoolPublic)
 async def get(session: SessionDep, id: int):
-    existing = await WorkerPool.one_by_id(session, id)
+    existing = await WorkerPool.one_by_id(session, id, options=WORKER_POOL_LOAD_OPTIONS)
     if not existing or existing.deleted_at is not None:
         raise NotFoundException(message=f"worker pool {id} not found")
 
@@ -75,12 +83,12 @@ async def update(session: SessionDep, id: int, input: WorkerPoolUpdate):
             message=f"Failed to update worker pool {id}: {e}"
         )
 
-    return await WorkerPool.one_by_id(session, id)
+    return await WorkerPool.one_by_id(session, id, options=WORKER_POOL_LOAD_OPTIONS)
 
 
 @router.delete("/{id}")
 async def delete(session: SessionDep, id: int):
-    existing = await WorkerPool.one_by_id(session, id)
+    existing = await WorkerPool.one_by_id(session, id, options=WORKER_POOL_LOAD_OPTIONS)
     if not existing or existing.deleted_at is not None:
         raise NotFoundException(message=f"worker pool {id} not found")
     if len(existing.pool_workers) > 0:

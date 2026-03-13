@@ -2,10 +2,9 @@ import asyncio
 import logging
 
 from typing import Tuple, Dict, List
-from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.schemas.workers import Worker
 from gpustack.schemas.system_load import SystemLoad
-from gpustack.server.db import get_engine
+from gpustack.server.db import async_session
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +18,18 @@ def workers_by_cluster_id(workers: List[Worker]) -> Dict[int, List[Worker]]:
     return rtn
 
 
+def _safe_cpu_rate(worker: Worker) -> float:
+    if worker.status and worker.status.cpu and worker.status.cpu.utilization_rate:
+        return worker.status.cpu.utilization_rate
+    return 0.0
+
+
+def _safe_memory_rate(worker: Worker) -> float:
+    if worker.status and worker.status.memory and worker.status.memory.utilization_rate:
+        return worker.status.memory.utilization_rate
+    return 0.0
+
+
 def compute_avg_cpu_memory_utilization_rate(
     workers: List[Worker],
 ) -> Dict[int | None, Tuple[float, float]]:
@@ -29,12 +40,8 @@ def compute_avg_cpu_memory_utilization_rate(
     cpu_sum_value = 0
     memory_sum_value = 0
     for cluster_id, cluster_workers in by_cluster.items():
-        cpu_value = sum(
-            worker.status.cpu.utilization_rate or 0 for worker in cluster_workers
-        )
-        memory_value = sum(
-            worker.status.memory.utilization_rate or 0 for worker in cluster_workers
-        )
+        cpu_value = sum(_safe_cpu_rate(worker) for worker in cluster_workers)
+        memory_value = sum(_safe_memory_rate(worker) for worker in cluster_workers)
         rtn[cluster_id] = (
             cpu_value / len(cluster_workers),
             memory_value / len(cluster_workers),
@@ -123,17 +130,15 @@ def compute_system_load(workers: List[Worker]) -> List[SystemLoad]:
 class SystemLoadCollector:
     def __init__(self, interval=60):
         self.interval = interval
-        self._engine = get_engine()
 
     async def start(self):
         while True:
             await asyncio.sleep(self.interval)
             try:
-                async with AsyncSession(self._engine) as session:
+                async with async_session() as session:
                     workers = await Worker.all(session=session)
                     system_loads = compute_system_load(workers)
-                    for system_load in system_loads:
-                        await SystemLoad.create(session, system_load, auto_commit=False)
+                    session.add_all(system_loads)
                     await session.commit()
             except Exception as e:
                 logger.error(f"Failed to collect system load: {e}")

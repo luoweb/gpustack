@@ -8,6 +8,22 @@
 
 ## Before Migration
 
+### Breaking Changes
+
+#### 1. Removal of Ollama Model Source (since v0.7.x)
+
+- **Change:** Starting from version 0.7, GPUStack no longer supports `ollama` as a model source.
+- **Impact:** Models, Model Files, and Model Instances whose source is `ollama` will not be preserved during the upgrade process.
+- **Action Required:**  If you are upgrading from a version earlier than v0.7 and currently have models deployed from the `ollama` source, you must migrate these models manually before upgrading.  
+  We recommend re-deploying affected models using one of the supported sources:
+    - Hugging Face
+    - ModelScope
+    - Local path
+
+    You can perform this migration by re-deploying the models through the **GPUStack UI** before initiating the upgrade.
+
+### Backup Your Data
+
 !!! warning
 
       **Backup First:** Before starting the server migration, it’s strongly recommended to back up your database.
@@ -85,7 +101,7 @@ Also customizing the `--data-dir`, `GPUSTACK_DATA_DIR` is also supported in data
 
 #### External Database Migration
 
-GPUStack supports using an external database to store the management data. If you previously deployed GPUStack with an external database, start the server will following command:
+GPUStack supports using an external database to store the management data. If you previously deployed GPUStack with an external database, start the server with the following command:
 
 ```bash
 sudo docker run -d --name gpustack-server \
@@ -142,7 +158,7 @@ After the upgrade is complete, existing Model Instances may remain stuck in the 
 
 If you were using llama-box as the inference backend in previous versions, please note that llama-box is no longer supported as of v2.0.0. Use llama.cpp via the custom inference backend instead.
 
-1. Create a `llama.cpp` custom backend on Inference Backend page. For llama.cpp configuration, refer to this [document](./tutorials/using-custom-backends.md#deploy-gguf-models-with-llamacpp).
+1. Create a `llama.cpp` custom backend on Inference Backend page. For llama.cpp configuration, refer to this [document](./user-guide/inference-backend-management.md#enable-community-inference-backend).
 2. Go to the Deployment page, modify the model originally launched with llama-box, change the backend to llama.cpp
 3. Recreate the model instance after saving.
 

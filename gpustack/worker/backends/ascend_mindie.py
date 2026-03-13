@@ -112,7 +112,23 @@ class AscendMindIEParameters:
     prefill_expected_time_ms: Optional[int] = None
     decode_expected_time_ms: Optional[int] = None
 
-    def from_args(self, args: List[str]):
+    def from_args_and_envs(
+        self, args: List[str], envs: Optional[Dict[str, str]] = None
+    ):
+        """
+        Parse parameters from command line arguments and environment variables.
+
+        Args:
+            args:
+                A list of command line arguments.
+            envs:
+                A dictionary of environment variables. Optional.
+
+        Raises:
+            Failed to parse the arguments or invalid argument values will raise.
+
+        """
+
         parser = argparse.ArgumentParser(exit_on_error=False, allow_abbrev=False)
         #
         # Log config
@@ -174,7 +190,6 @@ class AscendMindIEParameters:
         )
         parser.add_argument(
             "--truncation",
-            type=bool,
             action=argparse.BooleanOptionalAction,
             help="Truncate the input token length, "
             "when the length is larger than the minimum between `--max-input-token-len` and `--max-seq-len` - 1.",
@@ -192,7 +207,6 @@ class AscendMindIEParameters:
         parser.add_argument(
             "--npu-memory-fraction",
             type=float,
-            default=self.npu_memory_fraction,
             help="The fraction of NPU memory to be used for the model executor, "
             "which can range from 0 to 1 (included). "
             "For example, a value of 0.5 would imply 50% NPU memory utilization. "
@@ -294,7 +308,6 @@ class AscendMindIEParameters:
         )
         parser.add_argument(
             "--support-select-batch",
-            type=bool,
             action=argparse.BooleanOptionalAction,
             help="Enable batch selecting. "
             "According to `--prefill-time-ms-per-req` and `--decode-time-ms-per-req`, "
@@ -326,7 +339,6 @@ class AscendMindIEParameters:
         )
         parser.add_argument(
             "--enable-memory-decoding",
-            type=bool,
             action=argparse.BooleanOptionalAction,
             help="Enable memory decoding speculation. "
             "Use `--no-enable-memory-decoding` to disable explicitly.",
@@ -344,7 +356,6 @@ class AscendMindIEParameters:
         )
         parser.add_argument(
             "--enable-lookahead",
-            type=bool,
             action=argparse.BooleanOptionalAction,
             help="Enable lookahead speculation. "
             "Use `--no-enable-lookahead` to disable explicitly.",
@@ -369,7 +380,6 @@ class AscendMindIEParameters:
         )
         parser.add_argument(
             "--enable-buffer-response",
-            type=bool,
             action=argparse.BooleanOptionalAction,
             help="Enable buffer response. "
             "Use `--no-enable-buffer-response` to disable explicitly.",
@@ -388,7 +398,6 @@ class AscendMindIEParameters:
         )
         parser.add_argument(
             "--enable-split",
-            type=bool,
             action=argparse.BooleanOptionalAction,
             help="Enable split fuse, something like chunked prefill. "
             "Use `--no-enable-split` to disable explicitly.",
@@ -419,7 +428,6 @@ class AscendMindIEParameters:
         )
         parser.add_argument(
             "--enable-multi-token-prediction",
-            type=bool,
             action=argparse.BooleanOptionalAction,
             help="Enable multi-token prediction. "
             "Use `--no-enable-multi-token-prediction` to disable explicitly.",
@@ -433,7 +441,6 @@ class AscendMindIEParameters:
         )
         parser.add_argument(
             "--enable-prefix-caching",
-            type=bool,
             action=argparse.BooleanOptionalAction,
             help="Enable prefix caching. "
             "Use `--no-enable-prefix-caching` to disable explicitly.",
@@ -540,10 +547,10 @@ class AscendMindIEParameters:
         )
 
         if args:
-            args_parsed = parser.parse_known_args(args=args)
+            args_parsed, _ = parser.parse_known_args(args=args)
             for attr_name in [attr.name for attr in dataclasses.fields(self.__class__)]:
                 try:
-                    attr_value = getattr(args_parsed[0], attr_name, None)
+                    attr_value = getattr(args_parsed, attr_name, None)
                     if attr_value is not None:
                         try:
                             setattr(self, attr_name, attr_value)
@@ -556,9 +563,38 @@ class AscendMindIEParameters:
                     # If reach here, that means the field is an internal property,
                     # which would not register in the argument parser.
                     pass
+            if not hasattr(args_parsed, "npu_memory_fraction"):
+                self._from_envs(envs or {})
+        else:
+            self._from_envs(envs or {})
 
         self._default()
         self._validate()
+
+    def _from_envs(self, envs: Dict[str, str]):
+        """
+        Parse parameters from environment variables.
+
+        Supported environment variables:
+        - NPU_MEMORY_FRACTION: The fraction of NPU memory to be used for the model executor.
+
+        Args:
+            envs:
+                A dictionary of environment variables.
+
+        """
+        allowed_env_attr_mapping = {
+            "NPU_MEMORY_FRACTION": "npu_memory_fraction",
+        }
+        for env_var, attr_name in allowed_env_attr_mapping.items():
+            if env_var in envs:
+                try:
+                    attr_type = type(getattr(self, attr_name))
+                    setattr(self, attr_name, attr_type(envs[env_var]))
+                except ValueError as e:
+                    raise argparse.ArgumentTypeError(
+                        f"Invalid value for {env_var}: {envs[env_var]}"
+                    ) from e
 
     def _default(self):  # noqa: C901
         # Model deploy config
@@ -1057,14 +1093,17 @@ class AscendMindIEServer(InferenceServer):
         # -- Enforce using ATB as backend
         env["MINDIE_LLM_FRAMEWORK_BACKEND"] = "ATB"
         # -- Enforce using 80% of GPU memory.
-        env["NPU_MEMORY_FRACTION"] = "0.8"
+        env["NPU_MEMORY_FRACTION"] = env.pop("NPU_MEMORY_FRACTION", "0.8")
         # -- Disable OpenMP parallelism, speed up model loading.
         env["OMP_NUM_THREADS"] = env.pop("OMP_NUM_THREADS", "1")
+        # -- Enable safetensors GPU loading pass-through for faster model loading.
+        env["SAFETENSORS_FAST_GPU"] = env.pop("SAFETENSORS_FAST_GPU", "1")
         # -- Improve performance.
         env["MINDIE_ASYNC_SCHEDULING_ENABLE"] = env.pop(
             "MINDIE_ASYNC_SCHEDULING_ENABLE", "1"
         )
-        env["TASK_QUEUE_ENABLE"] = env.pop("TASK_QUEUE_ENABLE", "2")
+        env["TASK_QUEUE_ENABLE"] = env.pop("TASK_QUEUE_ENABLE", "1")
+        env["CPU_AFFINITY_CONF"] = env.pop("CPU_AFFINITY_CONF", "1")
         env["ATB_OPERATION_EXECUTE_ASYNC"] = "1"
         env["ATB_LAYER_INTERNAL_TENSOR_REUSE"] = env.pop(
             "ATB_LAYER_INTERNAL_TENSOR_REUSE", "1"
@@ -1177,7 +1216,7 @@ class AscendMindIEServer(InferenceServer):
             logger.debug(
                 f"Parsing given parameters: {os.linesep}{os.linesep.join(self._model.backend_parameters)}"
             )
-            params.from_args(self._flatten_backend_param())
+            params.from_args_and_envs(self._flatten_backend_param(), env)
 
             # -- Log config
             log_config["logLevel"] = params.log_level
@@ -1453,11 +1492,11 @@ class AscendMindIEServer(InferenceServer):
             env["ATB_LLM_HCCL_ENABLE"] = env.pop("ATB_LLM_HCCL_ENABLE", "1")
             env["ATB_LLM_COMM_BACKEND"] = env.pop("ATB_LLM_COMM_BACKEND", "hccl")
             env["HCCL_CONNECT_TIMEOUT"] = env.pop("HCCL_CONNECT_TIMEOUT", "7200")
-            env["HCCL_EXEC_TIMEOUT"] = env.pop("HCCL_EXEC_TIMEOUT", "0")
             env["HCCL_RDMA_PCIE_DIRECT_POST_NOSTRICT"] = env.pop(
                 "HCCL_RDMA_PCIE_DIRECT_POST_NOSTRICT", "TRUE"
             )
-            if env.get("CANN_CHIP", "310p") != "310p":
+            if not is_ascend_310p(self._get_selected_gpu_devices()):
+                env["HCCL_EXEC_TIMEOUT"] = env.pop("HCCL_EXEC_TIMEOUT", "0")
                 env["HCCL_OP_EXPANSION_MODE"] = env.pop("HCCL_OP_EXPANSION_MODE", "AIV")
             # NB(thxCode): For deterministic calculation, needs the following environment variables.
             # LCCL_DETERMINISTIC=1
@@ -1487,6 +1526,12 @@ class AscendMindIEServer(InferenceServer):
         # Indicate the JSON configuration file.
         env["MIES_CONFIG_JSON_PATH"] = str(config_path)
 
+        command = None
+        if self.inference_backend:
+            command = self.inference_backend.get_container_entrypoint(
+                self._model.backend_version
+            )
+
         command_script = self._get_serving_command_script(env)
 
         command_args = self.build_versioned_command_args(
@@ -1497,6 +1542,7 @@ class AscendMindIEServer(InferenceServer):
 
         self._create_workload(
             deployment_metadata=deployment_metadata,
+            command=command,
             command_script=command_script,
             command_args=command_args,
             env=env,
@@ -1507,6 +1553,7 @@ class AscendMindIEServer(InferenceServer):
     def _create_workload(
         self,
         deployment_metadata: ModelInstanceDeploymentMetadata,
+        command: Optional[List[str]],
         command_script: Optional[str],
         command_args: List[str],
         env: Dict[str, str],
@@ -1517,6 +1564,12 @@ class AscendMindIEServer(InferenceServer):
         if not image:
             raise ValueError("Failed to get Ascend MindIE backend image")
 
+        # Command script will override the given command,
+        # so we need to prepend command to command args.
+        if command_script and command:
+            command_args = command + command_args
+            command = None
+
         resources = self._get_configured_resources(
             mount_all_devices=deployment_metadata.distributed,
         )
@@ -1525,6 +1578,9 @@ class AscendMindIEServer(InferenceServer):
 
         ports = self._get_configured_ports()
 
+        # Read container config from environment variables
+        container_config = self._get_container_env_config(env)
+
         run_container = Container(
             image=image,
             name="default",
@@ -1532,9 +1588,12 @@ class AscendMindIEServer(InferenceServer):
             restart_policy=ContainerRestartPolicyEnum.NEVER,
             execution=ContainerExecution(
                 privileged=True,
+                command=command,
                 command_script=command_script,
                 args=command_args,
                 working_dir=working_dir,
+                run_as_user=container_config.user,
+                run_as_group=container_config.group,
             ),
             envs=[
                 ContainerEnv(
@@ -1554,6 +1613,7 @@ class AscendMindIEServer(InferenceServer):
         )
         logger.info(
             f"With image: {image}, "
+            f"command: [{' '.join(command) if command else ''}], "
             f"arguments: [{' '.join(command_args)}], "
             f"ports: [{','.join([str(port.internal) for port in ports])}], "
             f"envs(inconsistent input items mean unchangeable):{os.linesep}"
@@ -1563,10 +1623,11 @@ class AscendMindIEServer(InferenceServer):
         workload_plan = WorkloadPlan(
             name=deployment_metadata.name,
             host_network=True,
-            shm_size=10 * 1 << 30,  # 10 GiB
+            shm_size=int(container_config.shm_size_gib * (1 << 30)),
             containers=[run_container],
+            run_as_user=container_config.user,
+            run_as_group=container_config.group,
         )
-
         create_workload(self._transform_workload_plan(workload_plan))
 
         logger.info(
@@ -1594,7 +1655,6 @@ class AscendMindIEServer(InferenceServer):
 if [ -n "${PYPI_PACKAGES_INSTALL:-}" ]; then
     if command -v uv >/dev/null 2>&1; then
         echo "Installing additional PyPi packages: ${PYPI_PACKAGES_INSTALL}"
-        export UV_PRERELEASE=allow
         export UV_HTTP_TIMEOUT=500
         export UV_NO_CACHE=1
         if [ -n "${PIP_INDEX_URL:-}" ]; then
@@ -1611,7 +1671,6 @@ if [ -n "${PYPI_PACKAGES_INSTALL:-}" ]; then
         echo "Installing additional PyPi packages: ${PYPI_PACKAGES_INSTALL}"
         export PIP_DISABLE_PIP_VERSION_CHECK=1
         export PIP_ROOT_USER_ACTION=ignore
-        export PIP_PRE=1
         export PIP_TIMEOUT=500
         export PIP_NO_CACHE_DIR=1
         pip install ${PYPI_PACKAGES_INSTALL}
@@ -1745,7 +1804,17 @@ fi
         "openAiSupport" : "vllm",
         "tokenTimeout" : 600,
         "e2eTimeout" : 600,
-        "distDPServerEnabled":false
+        "distDPServerEnabled":false,
+        "layerwiseDisaggregated" : false,
+        "layerwiseDisaggregatedRoleType" : "",
+        "layerwiseDisaggregatedMasterIpAddress" : "127.0.0.3",
+        "layerwiseDisaggregatedSlaveIpAddress" : ["127.0.0.4"],
+        "layerwiseDisaggregatedDataPort" : 10024,
+        "layerwiseDisaggregatedCrtlPort" : [10001,10002],
+        "HealthCheckConfig" :
+        {
+            "npuUsageThreshold" : 0
+        }
     },
 
     "BackendConfig" : {
@@ -1808,7 +1877,15 @@ fi
             "maxQueueDelayMicroseconds" : 5000,
             "maxFirstTokenWaitTime": 2500
         }
-    }
+    },
+
+    "LogConfig": {
+        "dynamicLogLevel" : "",
+        "dynamicLogLevelValidHours" : 2,
+        "dynamicLogLevelValidTime" : ""
+    },
+
+    "EnableDynamicAdjustTimeoutConfig": false
 }
 """
         return json.loads(config_str)

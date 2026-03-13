@@ -1,8 +1,9 @@
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlmodel import String, cast, func, or_
 from pathlib import Path
+from sqlalchemy.orm import selectinload
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
@@ -10,10 +11,12 @@ from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
 )
-from gpustack.server.deps import ListParamsDep, SessionDep, EngineDep
+from gpustack.server.db import async_session
+from gpustack.server.deps import SessionDep
 from gpustack.schemas.model_files import (
     ModelFile,
     ModelFileCreate,
+    ModelFileListParams,
     ModelFilePublic,
     ModelFileStateEnum,
     ModelFileUpdate,
@@ -25,9 +28,7 @@ router = APIRouter()
 
 @router.get("", response_model=ModelFilesPublic)
 async def get_model_files(
-    engine: EngineDep,
-    session: SessionDep,
-    params: ListParamsDep,
+    params: ModelFileListParams = Depends(),
     search: str = None,
     worker_id: int = None,
 ):
@@ -44,7 +45,6 @@ async def get_model_files(
     if params.watch:
         return StreamingResponse(
             ModelFile.streaming(
-                engine,
                 fields=fields,
                 filter_func=get_filter_func(search),
             ),
@@ -75,13 +75,36 @@ async def get_model_files(
             )
         )
 
-    return await ModelFile.paginated_by_query(
-        session=session,
-        fields=fields,
-        extra_conditions=extra_conditions,
-        page=params.page,
-        per_page=params.perPage,
-    )
+    order_by = params.order_by
+
+    order_by = params.order_by
+    if order_by:
+        new_order_by = []
+        for field, direction in order_by:
+            if field == "source":
+                # When sorting by "source", add additional sorting fields for deterministic ordering
+                new_order_by.append((field, direction))
+                new_order_by.append(("huggingface_repo_id", direction))
+                new_order_by.append(("huggingface_filename", direction))
+                new_order_by.append(("model_scope_model_id", direction))
+                new_order_by.append(("model_scope_file_path", direction))
+                new_order_by.append(("local_path", direction))
+            elif field == "resolved_paths":
+                # resolved_paths is a JSON field, replace resolved_paths ordering with expression
+                new_order_by.append((cast(ModelFile.resolved_paths, String), direction))
+            else:
+                new_order_by.append((field, direction))
+        order_by = new_order_by
+
+    async with async_session() as session:
+        return await ModelFile.paginated_by_query(
+            session=session,
+            fields=fields,
+            extra_conditions=extra_conditions,
+            page=params.page,
+            per_page=params.perPage,
+            order_by=order_by,
+        )
 
 
 def search_model_file_filter(data: ModelFile, search: str) -> bool:
@@ -182,7 +205,9 @@ async def update_model_file(
 async def delete_model_file(
     session: SessionDep, id: int, cleanup: Optional[bool] = None
 ):
-    model_file = await ModelFile.one_by_id(session, id)
+    model_file = await ModelFile.one_by_id(
+        session, id, options=[selectinload(ModelFile.instances)]
+    )
     if not model_file:
         raise NotFoundException(message=f"Model file {id} not found")
 

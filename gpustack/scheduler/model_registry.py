@@ -1,4 +1,4 @@
-# Synced with https://github.com/vllm-project/vllm/blob/v0.11.2/vllm/model_executor/models/registry.py
+# Synced with https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/model_executor/models/registry.py
 # Update these when the builtin vLLM is updated
 # List of supported model architectures for the default version of the vLLM backend
 # TODO version-aware support list
@@ -13,6 +13,7 @@ _TEXT_GENERATION_MODELS = [
     "AquilaForCausalLM",
     "ArceeForCausalLM",
     "ArcticForCausalLM",
+    "AXK1ForCausalLM",
     "MiniMaxForCausalLM",
     "MiniMaxText01ForCausalLM",
     "MiniMaxM1ForCausalLM",
@@ -20,6 +21,7 @@ _TEXT_GENERATION_MODELS = [
     "BaichuanForCausalLM",
     "BailingMoeForCausalLM",
     "BailingMoeV2ForCausalLM",
+    "BailingMoeV2_5ForCausalLM",
     "BambaForCausalLM",
     "BloomForCausalLM",
     "ChatGLMModel",
@@ -38,6 +40,7 @@ _TEXT_GENERATION_MODELS = [
     "Ernie4_5_MoeForCausalLM",
     "ExaoneForCausalLM",
     "Exaone4ForCausalLM",
+    "ExaoneMoEForCausalLM",
     "Fairseq2LlamaForCausalLM",
     "FalconForCausalLM",
     "FalconMambaForCausalLM",
@@ -51,6 +54,8 @@ _TEXT_GENERATION_MODELS = [
     "GlmForCausalLM",
     "Glm4ForCausalLM",
     "Glm4MoeForCausalLM",
+    "Glm4MoeLiteForCausalLM",
+    "GlmMoeDsaForCausalLM",
     "GptOssForCausalLM",
     "GPT2LMHeadModel",
     "GPTBigCodeForCausalLM",
@@ -62,6 +67,7 @@ _TEXT_GENERATION_MODELS = [
     "GraniteMoeSharedForCausalLM",
     "GritLM",
     "Grok1ModelForCausalLM",
+    "Grok1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HCXVisionForCausalLM",
@@ -69,6 +75,8 @@ _TEXT_GENERATION_MODELS = [
     "InternLM2ForCausalLM",
     "InternLM2VEForCausalLM",
     "InternLM3ForCausalLM",
+    "IQuestCoderForCausalLM",
+    "IQuestLoopCoderForCausalLM",
     "JAISLMHeadModel",
     "JambaForCausalLM",
     "KimiLinearForCausalLM",
@@ -93,8 +101,10 @@ _TEXT_GENERATION_MODELS = [
     "MptForCausalLM",
     "MPTForCausalLM",
     "MiMoForCausalLM",
+    "MiMoV2FlashForCausalLM",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
+    "NemotronHPuzzleForCausalLM",
     "OlmoForCausalLM",
     "Olmo2ForCausalLM",
     "Olmo3ForCausalLM",
@@ -103,6 +113,7 @@ _TEXT_GENERATION_MODELS = [
     "OrionForCausalLM",
     "OuroForCausalLM",
     "PanguEmbeddedForCausalLM",
+    "PanguProMoEV2ForCausalLM",
     "PanguUltraMoEForCausalLM",
     "PersimmonForCausalLM",
     "PhiForCausalLM",
@@ -118,7 +129,9 @@ _TEXT_GENERATION_MODELS = [
     "Qwen3MoeForCausalLM",
     "RWForCausalLM",
     "SeedOssForCausalLM",
+    "Step1ForCausalLM",
     "Step3TextForCausalLM",
+    "Step3p5ForCausalLM",
     "StableLMEpochForCausalLM",
     "StableLmForCausalLM",
     "Starcoder2ForCausalLM",
@@ -137,6 +150,9 @@ _EMBEDDING_MODELS = [
     # [Text-only]
     "BertModel",
     "BertSpladeSparseEmbeddingModel",
+    "HF_ColBERT",
+    "ColBERTModernBertModel",
+    "ColBERTJinaRobertaModel",
     "DeciLMForCausalLM",
     "Gemma2Model",
     "Gemma3TextModel",
@@ -147,6 +163,7 @@ _EMBEDDING_MODELS = [
     "GteNewModel",
     "InternLM2ForRewardModel",
     "JambaForSequenceClassification",
+    "LlamaBidirectionalModel",
     "LlamaModel",
     # "AquilaModel", # Registered in _TEXT_GENERATION_MODELS
     # "AquilaForCausalLM", # Registered in _TEXT_GENERATION_MODELS
@@ -167,12 +184,20 @@ _EMBEDDING_MODELS = [
     "RobertaForMaskedLM",
     "RobertaModel",
     # "TeleChat2ForCausalLM", # Registered in _TEXT_GENERATION_MODELS
+    "VoyageQwen3BidirectionalEmbedModel",
     "XLMRobertaModel",
+    "BgeM3EmbeddingModel",
     # [Multimodal]
     # "LlavaNextForConditionalGeneration", # Registered in _TEXT_GENERATION_MODELS
     # "Phi3VForCausalLM",
     # "Qwen2VLForConditionalGeneration", # Registered in _TEXT_GENERATION_MODELS
     "CLIPModel",
+    "ColModernVBertForRetrieval",
+    "ColQwen3",
+    "OpsColQwen3Model",
+    "Qwen3VLNemotronEmbedModel",
+    "SiglipModel",
+    "LlamaNemotronVLModel",
     "PrithviGeoSpatialMAE",
     "Terratorch",
 ]
@@ -185,13 +210,16 @@ _CROSS_ENCODER_MODELS = [
     "XLMRobertaForSequenceClassification",
     "ModernBertForSequenceClassification",
     "ModernBertForTokenClassification",
-    # [Auto-converted]
     "JinaVLForRanking",
+    "LlamaBidirectionalForSequenceClassification",
+    "LlamaNemotronVLForSequenceClassification",
 ]
 
 _MULTIMODAL_MODELS = [
     # [Decoder-only]
     "AriaForConditionalGeneration",
+    "AudioFlamingo3ForConditionalGeneration",
+    "MusicFlamingoForConditionalGeneration",
     "AyaVisionForConditionalGeneration",
     "BeeForConditionalGeneration",
     "Blip2ForConditionalGeneration",
@@ -199,7 +227,9 @@ _MULTIMODAL_MODELS = [
     "Cohere2VisionForConditionalGeneration",
     "DeepseekVLV2ForCausalLM",
     "DeepseekOCRForCausalLM",
+    "DeepseekOCR2ForCausalLM",
     "DotsOCRForCausalLM",
+    "Eagle2_5_VLForConditionalGeneration",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "FuyuForCausalLM",
     "Gemma3ForConditionalGeneration",
@@ -208,19 +238,26 @@ _MULTIMODAL_MODELS = [
     "Glm4vForConditionalGeneration",
     "Glm4v_moeForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",  # Note: New class for "Glm4v_moeForConditionalGeneration"
-    "GraniteSpeechForConditionalGeneration",
+    "GlmOcrForConditionalGeneration",
     "H2OVLChatModel",
+    "HunYuanVLForConditionalGeneration",
+    "StepVLForConditionalGeneration",
     "InternVLChatModel",
     "NemotronH_Nano_VL_V2",
     "InternS1ForConditionalGeneration",
     "InternVLForConditionalGeneration",
+    "InternS1ProForConditionalGeneration",
     "Idefics3ForConditionalGeneration",
+    "IsaacForConditionalGeneration",
     "SmolVLMForConditionalGeneration",
+    "KananaVForConditionalGeneration",
     "KeyeForConditionalGeneration",
     "KeyeVL1_5ForConditionalGeneration",
     "RForConditionalGeneration",
     "KimiVLForConditionalGeneration",
+    "KimiK25ForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
+    "Lfm2VlForConditionalGeneration",
     "Llama_Nemotron_Nano_VL",
     "Llama4ForConditionalGeneration",
     "LlavaForConditionalGeneration",
@@ -234,9 +271,13 @@ _MULTIMODAL_MODELS = [
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
     "MolmoForCausalLM",
+    "Molmo2ForConditionalGeneration",
     "NVLM_D",
+    "OpenPanguVLForConditionalGeneration",
     "Ovis",
     "Ovis2_5",
+    "Ovis2_6ForCausalLM",
+    "Ovis2_6_MoeForCausalLM",
     "PaddleOCRVLForConditionalGeneration",
     "PaliGemmaForConditionalGeneration",
     "Phi3VForCausalLM",
@@ -252,18 +293,37 @@ _MULTIMODAL_MODELS = [
     "Qwen3OmniMoeForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "UltravoxModel",
     "SkyworkR1VChatModel",
     "Step3VLForConditionalGeneration",
     "TarsierForConditionalGeneration",
     "Tarsier2ForConditionalGeneration",
-    "VoxtralForConditionalGeneration",
+    "VoxtralStreamingGeneration",
     # [Encoder-decoder]
     "Florence2ForConditionalGeneration",
     "MllamaForConditionalGeneration",
     "Llama4ForConditionalGeneration",
     "SkyworkR1VChatModel",
+    "NemotronParseForConditionalGeneration",
+]
+
+_SPEECH_TO_TEXT_MODELS = [
+    "FireRedASR2ForConditionalGeneration",
+    "FunASRForConditionalGeneration",
+    "FunAudioChatForConditionalGeneration",
+    "GlmAsrForConditionalGeneration",
+    "GraniteSpeechForConditionalGeneration",
+    "Qwen3ASRForConditionalGeneration",
+    "Qwen3ASRRealtimeGeneration",
+    "VoxtralForConditionalGeneration",
+    "VoxtralRealtimeGeneration",
     "WhisperForConditionalGeneration",
+]
+
+_TEXT_TO_SPEECH_MODELS = [
+    "Qwen3TTSForConditionalGeneration",
 ]
 
 _TRANSFORMERS_SUPPORTED_MODELS = [
@@ -326,6 +386,10 @@ def detect_model_type(architectures: List[str]) -> CategoryEnum:
             return CategoryEnum.EMBEDDING
         if architecture in _RERANKER_MODELS:
             return CategoryEnum.RERANKER
+        if architecture in _SPEECH_TO_TEXT_MODELS:
+            return CategoryEnum.SPEECH_TO_TEXT
+        if architecture in _TEXT_TO_SPEECH_MODELS:
+            return CategoryEnum.TEXT_TO_SPEECH
         if architecture in _LLM_MODELS:
             return CategoryEnum.LLM
     return CategoryEnum.UNKNOWN

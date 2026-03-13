@@ -12,6 +12,7 @@ import sqlalchemy as sa
 import sqlmodel
 import gpustack
 from gpustack.schemas.stmt import model_user_after_drop_view_stmt
+from gpustack.schemas.common import SQLAlchemyJSON
 
 
 # revision identifiers, used by Alembic.
@@ -31,6 +32,26 @@ def upgrade() -> None:
     model_instance_proxy_mode.create(op.get_bind(), checkfirst=True)
     with op.batch_alter_table('workers', schema=None) as batch_op:
         batch_op.add_column(sa.Column('proxy_mode', model_instance_proxy_mode, nullable=True))
+        batch_op.add_column(sa.Column('advertise_address', sqlmodel.sql.sqltypes.AutoString(), nullable=True))
+
+    with op.batch_alter_table('model_instances', schema=None) as batch_op:
+        batch_op.add_column(sa.Column('worker_advertise_address', sqlmodel.sql.sqltypes.AutoString(), nullable=True))
+        batch_op.add_column(sa.Column('backend', sqlmodel.sql.sqltypes.AutoString(), nullable=True))
+        batch_op.add_column(sa.Column('backend_version', sqlmodel.sql.sqltypes.AutoString(), nullable=True))
+
+    with op.batch_alter_table('clusters', schema=None) as batch_op:
+        batch_op.add_column(sa.Column('server_url', sa.String(length=2048), nullable=True))
+        batch_op.add_column(sa.Column('worker_config',  SQLAlchemyJSON(), nullable=True))
+        batch_op.add_column(sa.Column('is_default', sa.Boolean(), nullable=False, server_default=sa.false()))
+
+    # Set the first cluster as default for deployment
+    conn = op.get_bind()
+    first_cluster = conn.execute(sa.text("SELECT id FROM clusters ORDER BY id LIMIT 1")).fetchone()
+    if first_cluster:
+        conn.execute(
+            sa.text("UPDATE clusters SET is_default = :is_default WHERE id = :id"),
+            {'is_default': True, 'id': first_cluster.id}
+        )
 
     op.execute(model_user_after_drop_view_stmt)
 
@@ -39,8 +60,14 @@ def upgrade() -> None:
 
     with op.batch_alter_table('inference_backends', schema=None) as batch_op:
         batch_op.alter_column('default_run_command', type_=sa.Text(), existing_type=sa.String(length=255), nullable=True)
-
-
+        batch_op.add_column(sa.Column('default_entrypoint', sa.Text(), nullable=True))
+        
+    source_affect_tables = ["model_instances", "model_files", "models"]
+    for table in source_affect_tables:
+        op.execute(sa.text(f"""
+            DELETE FROM {table}
+            WHERE source = :removed_source
+        """).bindparams(removed_source="OLLAMA_LIBRARY"))
 
 def downgrade() -> None:
     model_instance_proxy_mode = sa.Enum(
@@ -51,7 +78,18 @@ def downgrade() -> None:
     )
     with op.batch_alter_table('workers', schema=None) as batch_op:
         batch_op.drop_column('proxy_mode')
+        batch_op.drop_column('advertise_address')
     model_instance_proxy_mode.drop(op.get_bind(), checkfirst=True)
+
+    with op.batch_alter_table('model_instances', schema=None) as batch_op:
+        batch_op.drop_column('worker_advertise_address')
+        batch_op.drop_column('backend')
+        batch_op.drop_column('backend_version')
+
+    with op.batch_alter_table('clusters', schema=None) as batch_op:
+        batch_op.drop_column('server_url')
+        batch_op.drop_column('worker_config')
+        batch_op.drop_column('is_default')
 
     op.execute(model_user_after_drop_view_stmt)
 

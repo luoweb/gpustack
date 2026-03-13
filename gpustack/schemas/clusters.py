@@ -1,8 +1,8 @@
 import secrets
-from datetime import datetime
+from urllib.parse import urlparse
 from enum import Enum
-from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, computed_field, field_validator
+from typing import ClassVar, Optional, Dict, Any, List
+from pydantic import BaseModel, computed_field, field_validator, ConfigDict, PrivateAttr
 from sqlmodel import (
     Field,
     Relationship,
@@ -15,36 +15,24 @@ from sqlmodel import (
     String,
 )
 import sqlalchemy as sa
-from sqlalchemy.orm.state import InstanceState
-from sqlalchemy.orm.attributes import NO_VALUE
 from typing import TYPE_CHECKING
 
+from gpustack.schemas.config import (
+    SensitivePredefinedConfig,
+    PredefinedConfigNoDefaults,
+)
 from gpustack.mixins import BaseModelMixin
-from gpustack.schemas.common import PaginatedList, pydantic_column_type
+from gpustack.schemas.common import (
+    PublicFields,
+    ListParams,
+    PaginatedList,
+    pydantic_column_type,
+)
 
 if TYPE_CHECKING:
     from gpustack.schemas.models import Model, ModelInstance
     from gpustack.schemas.workers import Worker
     from gpustack.schemas.users import User
-
-
-def is_in_session(obj: SQLModel, attr: Optional[str] = None) -> bool:
-    insp: InstanceState = sa.inspect(obj)
-    if insp.session is None:
-        return False
-    if attr:
-        attr_state = insp.attrs.get(attr)
-        if attr_state is None:
-            return False
-        return attr_state.loaded_value is not NO_VALUE
-    return True
-
-
-class PublicFields:
-    id: int
-    created_at: datetime
-    updated_at: datetime
-    deleted_at: Optional[datetime] = None
 
 
 class WorkerPoolUpdate(SQLModel):
@@ -108,30 +96,35 @@ class WorkerPool(WorkerPoolBase, BaseModelMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     cluster: Optional["Cluster"] = Relationship(
         back_populates="cluster_worker_pools",
-        sa_relationship_kwargs={"lazy": "selectin"},
+        sa_relationship_kwargs={"lazy": "noload"},
     )
     pool_workers: list["Worker"] = Relationship(
-        sa_relationship_kwargs={"lazy": "selectin"},
+        sa_relationship_kwargs={"lazy": "noload"},
         back_populates="worker_pool",
     )
-    _workers: int = 0
-    _ready_workers: int = 0
+    _workers: int = PrivateAttr(default=-1)
+    _ready_workers: int = PrivateAttr(default=-1)
 
     @computed_field()
     @property
     def workers(self) -> int:
-        if not is_in_session(self, "pool_workers"):
-            return self._workers
-        return len(self.pool_workers) if self.pool_workers else 0
+        try:
+            if self._workers >= 0:
+                return self._workers
+        except TypeError:
+            pass
+        return len(self.pool_workers or [])
 
     @computed_field()
     @property
     def ready_workers(self) -> int:
-        if not is_in_session(self, "pool_workers"):
-            return self._ready_workers
-        if self.pool_workers is None or len(self.pool_workers) == 0:
-            return 0
-        return len([w for w in self.pool_workers if w.state.value == 'ready'])
+        try:
+            if self._ready_workers >= 0:
+                return self._ready_workers
+        except TypeError:
+            pass
+
+        return len([w for w in self.pool_workers or [] if w.state.value == 'ready'])
 
     def __hash__(self):
         return hash(self.id)
@@ -143,8 +136,8 @@ class WorkerPool(WorkerPoolBase, BaseModelMixin, table=True):
 
     def __init__(
         self,
-        workers: int = 0,
-        ready_workers: int = 0,
+        workers: int = -1,
+        ready_workers: int = -1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -204,6 +197,15 @@ class CloudCredential(CloudCredentialCreate, BaseModelMixin, table=True):
         return False
 
 
+class CloudCredentialListParams(ListParams):
+    sortable_fields: ClassVar[List[str]] = [
+        "name",
+        "provider",
+        "created_at",
+        "updated_at",
+    ]
+
+
 class CloudCredentialPublic(CloudCredentialBase, PublicFields):
     pass
 
@@ -212,6 +214,7 @@ CloudCredentialsPublic = PaginatedList[CloudCredentialPublic]
 
 
 class ClusterStateEnum(str, Enum):
+    PENDING = 'pending'
     PROVISIONING = 'provisioning'
     PROVISIONED = 'provisioned'
     READY = 'ready'
@@ -221,6 +224,28 @@ class ClusterUpdate(SQLModel):
     name: str
     description: Optional[str] = None
     gateway_endpoint: Optional[str] = None
+    server_url: Optional[str] = None
+    worker_config: Optional[PredefinedConfigNoDefaults] = Field(
+        default=None,
+        sa_column=Column(
+            pydantic_column_type(
+                PredefinedConfigNoDefaults,
+                exclude_none=True,
+                exclude_unset=True,
+                exclude_defaults=True,
+            )
+        ),
+    )
+
+    @field_validator("server_url")
+    def validate_server_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) == 0:
+            return None
+        if v is not None:
+            parsed = urlparse(v)
+            if not parsed.scheme or not parsed.netloc:
+                raise ValueError("Invalid server_url format")
+        return v
 
 
 class ClusterCreateBase(ClusterUpdate):
@@ -241,6 +266,7 @@ class ClusterBase(ClusterCreateBase):
         default=None, sa_column=Column(Text, nullable=True)
     )
     reported_gateway_endpoint: Optional[str] = None
+    is_default: bool = Field(default=False)
 
 
 class Cluster(ClusterBase, BaseModelMixin, table=True):
@@ -252,53 +278,58 @@ class Cluster(ClusterBase, BaseModelMixin, table=True):
     hashed_suffix: str = Field(nullable=False, default=secrets.token_hex(6))
     registration_token: str = Field(nullable=False, default=secrets.token_hex(16))
     cluster_worker_pools: List[WorkerPool] = Relationship(
-        sa_relationship_kwargs={"cascade": "delete", "lazy": "selectin"},
+        sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
         back_populates="cluster",
     )
     cluster_models: List["Model"] = Relationship(
-        sa_relationship_kwargs={"lazy": "selectin"}, back_populates="cluster"
+        sa_relationship_kwargs={"lazy": "noload"}, back_populates="cluster"
     )
     cluster_model_instances: List["ModelInstance"] = Relationship(
-        sa_relationship_kwargs={"lazy": "selectin"}, back_populates="cluster"
+        sa_relationship_kwargs={"lazy": "noload"}, back_populates="cluster"
     )
     cluster_users: list["User"] = Relationship(
-        sa_relationship_kwargs={"cascade": "delete", "lazy": "selectin"},
+        sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
         back_populates="cluster",
     )
     cluster_workers: List["Worker"] = Relationship(
-        sa_relationship_kwargs={"cascade": "delete", "lazy": "selectin"},
+        sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
         back_populates="cluster",
     )
-    _models: int = 0
-    _workers: int = 0
-    _ready_workers: int = 0
-    _gpus: int = 0
+    _models: int = PrivateAttr(default=-1)
+    _workers: int = PrivateAttr(default=-1)
+    _ready_workers: int = PrivateAttr(default=-1)
+    _gpus: int = PrivateAttr(default=-1)
 
     @computed_field()
     @property
     def workers(self) -> int:
-        if not is_in_session(self, "cluster_workers"):
-            return self._workers
-        return len(self.cluster_workers) if self.cluster_workers else 0
+        try:
+            if self._workers >= 0:
+                return self._workers
+        except TypeError:
+            pass
+        return len(self.cluster_workers or [])
 
     @computed_field()
     @property
     def ready_workers(self) -> int:
-        if not is_in_session(self, "cluster_workers"):
-            return self._ready_workers
-        if self.cluster_workers is None or len(self.cluster_workers) == 0:
-            return 0
-        return len([w for w in self.cluster_workers if w.state.value == 'ready'])
+        try:
+            if self._ready_workers >= 0:
+                return self._ready_workers
+        except TypeError:
+            pass
+        return len([w for w in self.cluster_workers or [] if w.state.value == 'ready'])
 
     @computed_field(alias="gpus")
     @property
     def gpus(self) -> int:
-        if not is_in_session(self, "cluster_workers"):
-            return self._gpus
-        if self.workers == 0:
-            return 0
+        try:
+            if self._gpus >= 0:
+                return self._gpus
+        except TypeError:
+            pass
         count = 0
-        for worker in self.cluster_workers:
+        for worker in self.cluster_workers or []:
             if worker.status is None or worker.status.gpu_devices is None:
                 continue
             count += len(worker.status.gpu_devices)
@@ -307,9 +338,12 @@ class Cluster(ClusterBase, BaseModelMixin, table=True):
     @computed_field(alias="models")
     @property
     def models(self) -> int:
-        if not is_in_session(self, "cluster_models"):
-            return self._models
-        return len(self.cluster_models) if self.cluster_models else 0
+        try:
+            if self._models >= 0:
+                return self._models
+        except TypeError:
+            pass
+        return len(self.cluster_models or [])
 
     def __hash__(self):
         return hash(self.id)
@@ -321,10 +355,10 @@ class Cluster(ClusterBase, BaseModelMixin, table=True):
 
     def __init__(
         self,
-        workers: int = 0,
-        ready_workers: int = 0,
-        gpus: int = 0,
-        models: int = 0,
+        workers: int = -1,
+        ready_workers: int = -1,
+        gpus: int = -1,
+        models: int = -1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -334,20 +368,47 @@ class Cluster(ClusterBase, BaseModelMixin, table=True):
         self._models = models
 
 
+class ClusterListParams(ListParams):
+    sortable_fields: ClassVar[List[str]] = [
+        "name",
+        "provider",
+        "state",
+        "workers",
+        "ready_workers",
+        "gpus",
+        "models",
+        "created_at",
+        "updated_at",
+    ]
+
+
 class ClusterPublic(ClusterBase, PublicFields):
     workers: int = Field(default=0)
     ready_workers: int = Field(default=0)
     gpus: int = Field(default=0)
     models: int = Field(default=0)
+    worker_config: Optional[PredefinedConfigNoDefaults] = Field(default=None)
 
 
 ClustersPublic = PaginatedList[ClusterPublic]
 
 
+class SensitiveRegistrationConfig(SensitivePredefinedConfig):
+    model_config = ConfigDict(extra="ignore")
+    token: str
+
+
 class ClusterRegistrationTokenPublic(BaseModel):
+    """
+    The arguments of docker run command to register a worker.
+    The env attribute is basically a dict of environment variables parsed from SensitiveRegistrationConfig.
+    """
+
     token: str
     server_url: str
     image: str
+    env: Dict[str, str]
+    args: List[str]
 
 
 class CredentialType(str, Enum):

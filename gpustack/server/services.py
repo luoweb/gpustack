@@ -1,11 +1,7 @@
-import asyncio
-import logging
-import functools
-from typing import Any, Callable, Dict, List, Optional, Union, Set, Tuple
-from aiocache import Cache, BaseCache
-from sqlmodel import SQLModel
+from typing import List, Optional, Union, Set, Tuple
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
-
+from sqlalchemy.orm import selectinload
 
 from gpustack.api.exceptions import InternalServerErrorException
 from gpustack.schemas.api_keys import ApiKey
@@ -15,78 +11,24 @@ from gpustack.schemas.models import (
     Model,
     ModelInstance,
     ModelInstanceStateEnum,
+)
+from gpustack.schemas.model_routes import (
+    ModelRoute,
     MyModel,
+    ModelRouteTarget,
+    TargetStateEnum,
     AccessPolicyEnum,
 )
 from gpustack.schemas.users import User
 from gpustack.schemas.clusters import Cluster
 from gpustack.schemas.workers import Worker
 from gpustack.server.usage_buffer import usage_flush_buffer
-
-logger = logging.getLogger(__name__)
-cache = Cache(Cache.MEMORY)
-
-
-def build_cache_key(func: Callable, *args, **kwargs):
-    if kwargs is None:
-        kwargs = {}
-    ordered_kwargs = sorted(kwargs.items())
-    return func.__qualname__ + str(args) + str(ordered_kwargs)
-
-
-async def delete_cache_by_key(func, *args, **kwargs):
-    key = build_cache_key(func, *args, **kwargs)
-    logger.trace(f"Deleting cache for key: {key}")
-    await cache.delete(key)
-
-
-async def set_cache_by_key(key: str, value: Any):
-    logger.trace(f"Set cache for key: {key}")
-    await cache.set(key, value)
-
-
-_cache_locks: Dict[str, asyncio.Lock] = {}
-
-
-class locked_cached:
-    def __init__(self, ttl: int = 30, cache: BaseCache = cache):
-        self.cache = cache
-        self.ttl = ttl
-
-    def __call__(self, f):
-        @functools.wraps(f)
-        async def wrapper(*args, **kwargs):
-            return await self.decorator(f, *args, **kwargs)
-
-        wrapper.cache = self.cache
-        return wrapper
-
-    async def get_from_cache(self, key: str):
-        return await self.cache.get(key)
-
-    async def set_in_cache(self, key: str, value: Any):
-        await self.cache.set(key, value, ttl=self.ttl)
-
-    async def decorator(self, f, *args, **kwargs):
-        # no self arg
-        key = build_cache_key(f, *args[1:], **kwargs)
-        value = await self.get_from_cache(key)
-        if value is not None:
-            return value
-
-        lock = _cache_locks.setdefault(key, asyncio.Lock())
-
-        async with lock:
-            value = await self.get_from_cache(key)
-            if value is not None:
-                return value
-
-            logger.trace(f"cache miss for key: {key}")
-            result = await f(*args, **kwargs)
-
-            await self.set_in_cache(key, result)
-
-        return result
+from gpustack.server.cache import (
+    build_cache_key,
+    delete_cache_by_key,
+    set_cache_by_key,
+    locked_cached,
+)
 
 
 class UserService:
@@ -94,9 +36,13 @@ class UserService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    @locked_cached(ttl=60)
+    @locked_cached()
     async def get_by_id(self, user_id: int) -> Optional[User]:
-        result = await User.one_by_id(self.session, user_id)
+        result = await User.one_by_id(
+            self.session,
+            user_id,
+            options=[selectinload(User.worker), selectinload(User.cluster)],
+        )
         if result is None:
             return None
         if result.worker is not None:
@@ -105,7 +51,7 @@ class UserService:
         self.session.expunge(result)
         return result
 
-    @locked_cached(ttl=60)
+    @locked_cached()
     async def get_by_username(self, username: str) -> Optional[User]:
         result = await User.one_by_field(self.session, "username", username)
         if result is None:
@@ -119,6 +65,7 @@ class UserService:
     async def update(self, user: User, source: Union[dict, SQLModel, None] = None):
         result = await user.update(self.session, source)
         await delete_cache_by_key(self.get_by_id, user.id)
+        await delete_cache_by_key(self.get_user_accessible_model_names, user.id)
         await delete_cache_by_key(self.get_by_username, user.username)
         return result
 
@@ -126,6 +73,7 @@ class UserService:
         apikeys = await APIKeyService(self.session).get_by_user_id(user.id)
         result = await user.delete(self.session)
         await delete_cache_by_key(self.get_by_id, user.id)
+        await delete_cache_by_key(self.get_user_accessible_model_names, user.id)
         await delete_cache_by_key(self.get_by_username, user.username)
         for apikey in apikeys:
             await delete_cache_by_key(
@@ -133,31 +81,37 @@ class UserService:
             )
         return result
 
-    @locked_cached(ttl=60)
-    async def get_user_accessible_model_names(
-        self, user_id: int, access_key: Optional[str]
-    ) -> Set[str]:
+    async def model_allowed_for_user(
+        self, model_name: str, user_id: int, api_key: Optional[ApiKey]
+    ) -> bool:
+        limited_model_names: Optional[Set[str]] = (
+            set(api_key.allowed_model_names)
+            if api_key is not None
+            and api_key.allowed_model_names is not None
+            and len(api_key.allowed_model_names) > 0
+            else None
+        )
+        accessible_model_names: Set[str] = await self.get_user_accessible_model_names(
+            user_id
+        )
+        return model_name in intersection_nullable_set(
+            accessible_model_names, limited_model_names
+        )
+
+    @locked_cached()
+    async def get_user_accessible_model_names(self, user_id: int) -> Set[str]:
         # Get all accessible model names for the user
         user: User = await self.get_by_id(user_id)
         if user is None:
-            return []
-        if user.is_admin:
-            all_models = await Model.all_by_field(self.session, "deleted_at", None)
+            return set()
+        if user.is_admin or user.is_system:
+            all_models = await ModelRoute.all_by_field(self.session, "deleted_at", None)
             model_names = {model.name for model in all_models}
         else:
             allowed_models = await MyModel.all_by_fields(
                 self.session, {"user_id": user.id, "deleted_at": None}
             )
             model_names = {model.name for model in allowed_models}
-        if access_key is not None:
-            api_key: ApiKey = await APIKeyService(self.session).get_by_access_key(
-                access_key
-            )
-            if (
-                api_key.allowed_model_names is not None
-                and len(api_key.allowed_model_names) > 0
-            ):
-                model_names = model_names.intersection(set(api_key.allowed_model_names))
         return model_names
 
 
@@ -165,7 +119,7 @@ class APIKeyService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    @locked_cached(ttl=60)
+    @locked_cached()
     async def get_by_access_key(self, access_key: str) -> Optional[ApiKey]:
         result = await ApiKey.one_by_field(self.session, "access_key", access_key)
         if result is None:
@@ -191,7 +145,7 @@ class WorkerService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    @locked_cached(ttl=60)
+    @locked_cached()
     async def get_by_id(self, worker_id: int) -> Optional[Worker]:
         result = await Worker.one_by_id(self.session, worker_id)
         if result is None:
@@ -199,7 +153,19 @@ class WorkerService:
         self.session.expunge(result)
         return result
 
-    @locked_cached(ttl=60)
+    @locked_cached()
+    async def get_by_cluster_id_name(
+        self, cluster_id: int, name: str
+    ) -> Optional[Worker]:
+        result = await Worker.one_by_fields(
+            self.session, fields={"cluster_id": cluster_id, "name": name}
+        )
+        if result is None:
+            return None
+        self.session.expunge(result)
+        return result
+
+    @locked_cached()
     async def get_by_name(self, name: str) -> Optional[Worker]:
         result = await Worker.one_by_field(self.session, "name", name)
         if result is None:
@@ -215,6 +181,23 @@ class WorkerService:
         await delete_cache_by_key(self.get_by_name, worker.name)
         return result
 
+    async def batch_update(
+        self,
+        workers: List[Worker],
+        source: Union[dict, SQLModel, None] = None,
+        **kwargs,
+    ) -> int:
+        if not workers:
+            return 0
+
+        updated = await Worker.batch_update(self.session, workers)
+
+        for w in workers:
+            await delete_cache_by_key(self.get_by_id, w.id)
+            await delete_cache_by_key(self.get_by_name, w.name)
+
+        return updated
+
     async def delete(self, worker: Worker, **kwargs):
         worker_id = worker.id
         worker_name = worker.name
@@ -224,11 +207,93 @@ class WorkerService:
         return result
 
 
+class ModelRouteService:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    @locked_cached()
+    async def get_by_name(self, name: str) -> Optional[ModelRoute]:
+        result = await ModelRoute.one_by_field(self.session, "name", name)
+        if result is None:
+            return None
+        self.session.expunge(result)
+        return result
+
+    @locked_cached()
+    async def get_model_auth_info_by_name(
+        self, name: str
+    ) -> Optional[Tuple[AccessPolicyEnum, str]]:
+        route = await ModelRoute.one_by_field(self.session, "name", name)
+        if route is None:
+            return None
+        route_targets = await ModelRouteTarget.all_by_fields(
+            self.session,
+            fields={"route_id": route.id},
+        )
+        if len(route_targets) == 0:
+            return None
+        models = await Model.all_by_fields(
+            session=self.session,
+            fields={},
+            extra_conditions=[
+                Model.id.in_(
+                    [e.model_id for e in route_targets if e.model_id is not None]
+                )
+            ],
+        )
+        # set a default static token to avoid empty token response for public maas model route
+        registration_token = "static_token_not_found"
+        for model in models:
+            cluster = await Cluster.one_by_id(self.session, model.cluster_id)
+            if cluster.registration_token is not None:
+                registration_token = cluster.registration_token
+                break
+
+        return route.access_policy, registration_token
+
+    @locked_cached()
+    async def get_model_ids_by_model_route_name(self, name: str) -> List[Model]:
+        route_targets = await ModelRouteTarget.all_by_fields(
+            self.session,
+            fields={
+                "route_name": name,
+                "state": TargetStateEnum.ACTIVE,
+                "deleted_at": None,
+            },
+            options=[selectinload(ModelRouteTarget.model)],
+        )
+        models = [target.model for target in route_targets if target.model is not None]
+        for model in models:
+            self.session.expunge(model)
+        return models
+
+    async def update(
+        self,
+        model_route: ModelRoute,
+        source: Union[dict, SQLModel, None] = None,
+        auto_commit: bool = True,
+    ):
+        result = await model_route.update(self.session, source, auto_commit=auto_commit)
+        await delete_cache_by_key(self.get_model_auth_info_by_name, model_route.name)
+        await delete_cache_by_key(
+            self.get_model_ids_by_model_route_name, model_route.name
+        )
+        return result
+
+    async def delete(self, model_route: ModelRoute, auto_commit: bool = True):
+        result = await model_route.delete(self.session, auto_commit=auto_commit)
+        await delete_cache_by_key(self.get_model_auth_info_by_name, model_route.name)
+        await delete_cache_by_key(
+            self.get_model_ids_by_model_route_name, model_route.name
+        )
+        return result
+
+
 class ModelService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    @locked_cached(ttl=60)
+    @locked_cached()
     async def get_by_id(self, model_id: int) -> Optional[Model]:
         result = await Model.one_by_id(self.session, model_id)
         if result is None:
@@ -236,7 +301,7 @@ class ModelService:
         self.session.expunge(result)
         return result
 
-    @locked_cached(ttl=60)
+    @locked_cached()
     async def get_by_name(self, name: str) -> Optional[Model]:
         result = await Model.one_by_field(self.session, "name", name)
         if result is None:
@@ -244,30 +309,16 @@ class ModelService:
         self.session.expunge(result)
         return result
 
-    @locked_cached(ttl=60)
-    async def get_model_auth_info_by_name(
-        self, name: str
-    ) -> Optional[Tuple[AccessPolicyEnum, str]]:
-        model = await Model.one_by_field(self.session, "name", name)
-        cluster = (
-            await Cluster.one_by_id(self.session, model.cluster_id) if model else None
-        )
-        if model is None or cluster is None:
-            return None
-        return model.access_policy, cluster.registration_token
-
     async def update(self, model: Model, source: Union[dict, SQLModel, None] = None):
         result = await model.update(self.session, source)
         await delete_cache_by_key(self.get_by_id, model.id)
         await delete_cache_by_key(self.get_by_name, model.name)
-        await delete_cache_by_key(self.get_model_auth_info_by_name, model.name)
         return result
 
     async def delete(self, model: Model):
         result = await model.delete(self.session)
         await delete_cache_by_key(self.get_by_id, model.id)
         await delete_cache_by_key(self.get_by_name, model.name)
-        await delete_cache_by_key(self.get_model_auth_info_by_name, model.name)
         return result
 
 
@@ -275,7 +326,7 @@ class ModelInstanceService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    @locked_cached(ttl=60)
+    @locked_cached()
     async def get_running_instances(self, model_id: int) -> List[ModelInstance]:
         results = await ModelInstance.all_by_fields(
             self.session,
@@ -355,7 +406,7 @@ class ModelUsageService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    @locked_cached(ttl=60)
+    @locked_cached()
     async def get_by_fields(self, fields: dict) -> ModelUsage:
         result = await ModelUsage.one_by_fields(
             self.session,
@@ -420,3 +471,32 @@ class ModelFileService:
 
     async def create(self, model_file: ModelFile):
         return await ModelFile.create(self.session, model_file)
+
+
+def intersection_nullable_set(set1: Set[str], set2: Optional[Set[str]]) -> Set[str]:
+    if set2 is None:
+        return set1
+    return set1.intersection(set2)
+
+
+async def delete_accessible_model_cache(
+    *user_ids: int,
+):
+    for user_id in user_ids:
+        await delete_cache_by_key(UserService.get_user_accessible_model_names, user_id)
+
+
+async def revoke_model_access_cache(
+    session: AsyncSession,
+    model: Optional[ModelRoute] = None,
+    extra_user_ids: Optional[set[int]] = None,
+):
+    user_ids = set()
+    if model is None:
+        result = await session.exec(select(User.id))
+        user_ids = set(result.all())
+    else:
+        user_ids = {user.id for user in model.users}
+    if extra_user_ids:
+        user_ids.update(extra_user_ids)
+    await delete_accessible_model_cache(*user_ids)

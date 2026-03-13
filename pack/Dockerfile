@@ -24,8 +24,10 @@ ARG PYTHON_VERSION=3.11
 ARG GPUSTACK_BASE_IMAGE=base
 ARG GPUSTACK_RUNTIME_ROCM_VERSION=7.0.2
 ARG GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS
-ARG HIGRESS_VERSION=2.1.8
-ARG HIGRESS_APISERVER_VERSION=0.0.25
+ARG HIGRESS_VERSION=2.1.9
+ARG HIGRESS_APISERVER_VERSION=0.0.26
+ARG PROMETHEUS_VERSION=3.5.1
+ARG GRAFANA_VERSION=12.2.4
 
 # Stage Base
 #
@@ -235,6 +237,7 @@ uv
 yq
 hatchling
 py-spy
+poetry
 EOT
     pip install -r /tmp/requirements.txt
 
@@ -375,19 +378,13 @@ RUN --mount=type=bind,from=apiserver,source=/apiserver,dst=/mnt/apiserver,rw \
     cp /mnt/gateway/var/lib/istio/envoy/*.so /var/lib/istio/envoy/;
     cp /mnt/gateway/usr/local/bin/pilot-agent /usr/local/bin/pilot-agent;
     cp /mnt/gateway/usr/local/bin/envoy /usr/local/bin/envoy;
-    cp /mnt/gateway/usr/local/bin/higress-proxy-container-init.sh /usr/local/bin/;
     cp /mnt/gateway/usr/local/bin/supercronic-linux-${TARGETARCH} /usr/local/bin/;
     ln -s supercronic-linux-${TARGETARCH} supercronic && mv supercronic /usr/local/bin/;
-
-    # Prepare Higress
-    chmod a+x /usr/local/bin/higress-proxy-container-init.sh; \
-    sed -i 's/1337/0/g' /usr/local/bin/higress-proxy-container-init.sh; \
-    /usr/local/bin/higress-proxy-container-init.sh
-
 EOF
 # Initialize configurations
 COPY pack/rootfs/ /
-ENV GPUSTACK_HIGRESS_PLUGIN_DIR=/opt/data/plugins
+COPY docker-compose/grafana/grafana_dashboards/ /etc/dashboards/
+ENV GPUSTACK_HIGRESS_PLUGIN_DIR=/usr/local/share/gpustack-higress/plugins
 ## END Install Higress standalone components
 
 ## Install Skopeo
@@ -397,14 +394,14 @@ ARG GOPROXY="https://proxy.golang.org"
 RUN <<EOF
     # Skopeo
 
-    REQUIRED_SKOPEO_VERSION=1.13.3
+    REQUIRED_SKOPEO_VERSION=1.20.0
     # Install Skopeo for images mirroring
     apt-get update -y && apt-get install -y --no-install-recommends \
         skopeo
 
     IFS="." read -r MAJOR MINOR PATCH <<< "$(skopeo --version | awk '{print $3}' | cut -d'-' -f1)"
-    if (( MAJOR < 1 || ( MAJOR == 1 && MINOR < 14 ) )); then
-        GOLANG_VERSION=1.18.10
+    if (( MAJOR < 1 || ( MAJOR == 1 && MINOR < 21 ) )); then
+        GOLANG_VERSION=1.23.3
         echo "Skopeo version ${MAJOR}.${MINOR} is lower than required ${REQUIRED_SKOPEO_VERSION}, upgrading from source..."
 
         apt-get install -y --no-install-recommends \
@@ -441,6 +438,53 @@ RUN <<EOF
         && rm -rf /var/cache/apt
 EOF
 
+## Install Prometheus and Grafana
+
+ARG PROMETHEUS_VERSION
+ARG GRAFANA_VERSION
+RUN <<EOF
+    set -eux
+
+    apt-get update -y && apt-get install -y --no-install-recommends \
+        fontconfig
+
+    case "${TARGETARCH}" in
+        amd64)
+            PROM_ARCH="amd64"
+            GRAFANA_ARCH="amd64"
+            ;;
+        arm64)
+            PROM_ARCH="arm64"
+            GRAFANA_ARCH="arm64"
+            ;;
+        *)
+            echo "Unsupported TARGETARCH: ${TARGETARCH}"
+            exit 1
+            ;;
+    esac
+
+    curl --retry 3 --retry-connrefused -fL \
+        "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-${PROM_ARCH}.tar.gz" \
+        | tar -zx -C /opt
+    mv "/opt/prometheus-${PROMETHEUS_VERSION}.linux-${PROM_ARCH}" /opt/prometheus
+    ln -s /opt/prometheus/prometheus /usr/local/bin/prometheus
+    ln -s /opt/prometheus/promtool /usr/local/bin/promtool
+
+    curl --retry 3 --retry-connrefused -fL \
+        "https://dl.grafana.com/oss/release/grafana-${GRAFANA_VERSION}.linux-${GRAFANA_ARCH}.tar.gz" \
+        | tar -zx -C /opt
+    mv "/opt/grafana-${GRAFANA_VERSION}" /opt/grafana
+    ln -s /opt/grafana/bin/grafana-server /usr/local/bin/grafana-server
+    ln -s /opt/grafana/bin/grafana-cli /usr/local/bin/grafana-cli
+
+    mkdir -p /etc/grafana
+    cp /opt/grafana/conf/sample.ini /etc/grafana/grafana.ini.sample
+
+    rm -rf /var/tmp/* \
+        && rm -rf /tmp/* \
+        && rm -rf /var/cache/apt
+EOF
+
 ## Install GPUStack
 
 RUN --mount=type=cache,target=/root/.cache \
@@ -451,7 +495,6 @@ RUN --mount=type=cache,target=/root/.cache \
     export POETRY_NO_CACHE=0
     export UV_NO_CACHE=0
     export UV_SYSTEM_PYTHON=1
-    export UV_PRERELEASE=allow
     export UV_LINK_MODE=copy
 
     # Build GPUStack
@@ -468,7 +511,7 @@ RUN --mount=type=cache,target=/root/.cache \
         WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[audio]";
     fi
 
-    uv pip install --extra-index-url https://download.pytorch.org/whl/cpu/ \
+    uv pip install --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cpu/ \
         ${WHEEL_PACKAGE}
 
     # Download tools
@@ -607,11 +650,11 @@ ENV HYGON_VISIBLE_DEVICES="all" \
 ## Runs:
 ## - With container runtime installed:
 ##   + If installed Iluvatar container runtime as default runtime, try with:
-##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged ...
+##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged -v /usr/local/corex:/usr/local/corex:ro ...
 ##   + If there are mulitple container runtimes installed, try with:
-##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged --runtime iluvatar ...
+##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged --runtime iluvatar -v /usr/local/corex:/usr/local/corex:ro ...
 ##   + Disallowing privileged, try with:
-##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock ...
+##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock -v /usr/local/corex:/usr/local/corex:ro ...
 ## - Without container runtime installed:
 ##   + Allowing privileged, try with:
 ##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged -v /usr/local/corex:/usr/local/corex:ro ...
@@ -633,7 +676,7 @@ ENV IX_VISIBLE_DEVICES="all" \
 ##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged -v /opt/mxdriver:/opt/mxdriver:ro -v /opt/maca:/opt/maca:ro ...
 ##   + Disallowing privileged, try with:
 ##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --security-opt seccomp=unconfined -v /dev:/dev:ro -v /opt/mxdriver:/opt/mxdriver:ro -v /opt/maca:/opt/maca:ro ...
-ENV LD_LIBRARY_PATH="/opt/maca/lib:/opt/maca/ompi/lib:/opt/maca/ucx/lib:/opt/mxdriver/lib:${LD_LIBRARY_PATH}" \
+ENV LD_LIBRARY_PATH="/opt/maca/lib:/opt/mxdriver/lib:${LD_LIBRARY_PATH}" \
     GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES="/opt/maca;${GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES}"
 
 ## Active all MThreads devices detection,
@@ -644,7 +687,7 @@ ENV LD_LIBRARY_PATH="/opt/maca/lib:/opt/maca/ompi/lib:/opt/maca/ucx/lib:/opt/mxd
 ##   + If installed MThreads container runtime as default runtime, try with:
 ##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged ...
 ##   + If there are mulitple container runtimes installed, try with:
-##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged --runtime methreads ...
+##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --privileged --runtime mthreads ...
 ##   + Disallowing privileged, try with:
 ##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock ...
 ## - Without container runtime installed:
@@ -669,6 +712,21 @@ ENV NVIDIA_DISABLE_REQUIRE="true" \
     NVIDIA_VISIBLE_DEVICES="all" \
     NVIDIA_DRIVER_CAPABILITIES="compute,utility"
 
+## Active all T-Head devices detection,
+## works with (default) T-Head container runtime and privileged mode.
+## See https://help.aliyun.com/document_detail/2996754.html.
+## Runs:
+## - With container runtime installed:
+##   [TODO, TBD]
+## - Without container runtime installed:
+##   + Allowing privileged, try with:
+##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock -e GPUSTACK_RUNTIME_DOCKER_RESOURCE_INJECTION_POLICY=CDI -v /var/run/cdi:/var/run/cdi --privileged -v /usr/local/PPU_SDK:/usr/local/PPU_SDK:ro ...
+##   + Disallowing privileged, try with:
+##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock -e GPUSTACK_RUNTIME_DOCKER_RESOURCE_INJECTION_POLICY=CDI -v /var/run/cdi:/var/run/cdi --security-opt seccomp=unconfined -v /dev:/dev:ro -v /usr/local/PPU_SDK:/usr/local/PPU_SDK:ro ...
+ENV PPU_HOME="/usr/local/PPU_SDK" \
+    LD_LIBRARY_PATH="/usr/local/PPU_SDK/CUDA_SDK/lib64:/usr/local/PPU_SDK/lib:${LD_LIBRARY_PATH}" \
+    GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES="/usr/local/PPU_SDK;${GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES}"
+
 ## Active GPUStack runtime mirrored deployment mode,
 ## if getting an error like, "Found multiple Containers with the same hostname ...",
 ## please use `--env GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME=...` to specify the exact container name.
@@ -676,13 +734,18 @@ ENV NVIDIA_DISABLE_REQUIRE="true" \
 ARG GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS
 
 ## GPUSTACK_RUNTIME_LOG_EXCEPTION=false: Disable logging exceptions from gpustack-runtime.
+## GPUSTACK_RUNTIME_DEPLOY_CDI_SPECS_DIRECTORY=/var/run/cdi: Set CDI specs directory.
 ## GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT=true: Enable mirrored deployment mode.
 ## GPUSTACK_RUNTIME_DEPLOY_CORRECT_RUNNER_IMAGE=false: Disable auto correction of runner images.
+## GPUSTACK_RUNTIME_DOCKER_IMAGE_NO_PULL_VISUALIZATION=true: Disable visualizating image pull progress, instead using simple logs.
 ## GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS: Configure filter labels for mirrored deployment.
 ## GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES: Declare volumes to be ignored during mirrored deployment.
 ENV GPUSTACK_RUNTIME_LOG_EXCEPTION="false" \
+    GPUSTACK_RUNTIME_DEPLOY_CDI_SPECS_DIRECTORY="/var/run/cdi" \
     GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT="true" \
+    GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES="/var/run/cdi;${GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES}" \
     GPUSTACK_RUNTIME_DEPLOY_CORRECT_RUNNER_IMAGE="false" \
+    GPUSTACK_RUNTIME_DOCKER_IMAGE_NO_PULL_VISUALIZATION="true" \
     GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS="${GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS}"
 
 COPY --chmod=755 pack/entrypoint.sh /usr/bin/entrypoint.sh

@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 import httpx
 import logging
 import jwt
@@ -22,6 +24,7 @@ from gpustack import envs
 from gpustack.api.auth import (
     SESSION_COOKIE_NAME,
     OIDC_ID_TOKEN_COOKIE_NAME,
+    SSO_LOGIN_COOKIE_NAME,
     authenticate_user,
 )
 from gpustack.server.deps import CurrentUserDep, SessionDep
@@ -30,6 +33,8 @@ from fastapi.responses import RedirectResponse
 from lxml import etree
 from gpustack.utils.convert import safe_b64decode, inflate_data
 from urllib.parse import urlencode
+
+from gpustack.utils.network import use_proxy_env_for_url
 
 router = APIRouter()
 timeout = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=10.0)
@@ -277,6 +282,13 @@ async def saml_callback(request: Request, session: SessionDep):
             max_age=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
             expires=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
         )
+        response.set_cookie(
+            key=SSO_LOGIN_COOKIE_NAME,
+            value="true",
+            httponly=True,
+            max_age=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
+            expires=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
+        )
     except Exception as e:
         logger.error(f"SAML callback error: {str(e)}")
         raise UnauthorizedException(message=str(e))
@@ -293,6 +305,7 @@ async def saml_logout_callback(request: Request):
         pass
     response = RedirectResponse(url="/")
     response.delete_cookie(key=SESSION_COOKIE_NAME)
+    response.delete_cookie(key=SSO_LOGIN_COOKIE_NAME)
     return response
 
 
@@ -347,9 +360,10 @@ async def oidc_callback(request: Request, session: SessionDep):
         "client_secret": config.oidc_client_secret,
         "redirect_uri": config.oidc_redirect_uri,
     }
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    token_endpoint = config.openid_configuration["token_endpoint"]
+    use_proxy_env = use_proxy_env_for_url(token_endpoint)
+    async with httpx.AsyncClient(timeout=timeout, trust_env=use_proxy_env) as client:
         try:
-            token_endpoint = config.openid_configuration["token_endpoint"]
             token_res = await client.request("POST", token_endpoint, data=data)
             res_data = json.loads(token_res.text)
             if token_res.status_code != 200:
@@ -434,6 +448,13 @@ async def oidc_callback(request: Request, session: SessionDep):
                 max_age=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
                 expires=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
             )
+            response.set_cookie(
+                key=SSO_LOGIN_COOKIE_NAME,
+                value="true",
+                httponly=True,
+                max_age=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
+                expires=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
+            )
     except Exception as e:
         logger.warning(f"Failed to set id_token cookie: {str(e)}")
     return response
@@ -501,15 +522,18 @@ async def logout(request: Request):
         except Exception as e:
             logger.error(f"Failed to get SAML logout url: {str(e)}")
             external_logout_url = None
-    content = json.dumps({"logout_url": external_logout_url})
+    sso_login = request.cookies.get(SSO_LOGIN_COOKIE_NAME)
+    content = json.dumps({"logout_url": external_logout_url}) if sso_login else ""
     resp = Response(content=content, media_type="application/json")
     resp.delete_cookie(key=SESSION_COOKIE_NAME)
     resp.delete_cookie(key=OIDC_ID_TOKEN_COOKIE_NAME)
+    resp.delete_cookie(key=SSO_LOGIN_COOKIE_NAME)
     return resp
 
 
 @router.post("/update-password")
 async def update_password(
+    request: Request,
     session: SessionDep,
     user: CurrentUserDep,
     update_in: UpdatePassword,
@@ -520,3 +544,61 @@ async def update_password(
     hashed_password = get_secret_hash(update_in.new_password)
     patch = {"hashed_password": hashed_password, "require_password_change": False}
     await user.update(session, patch)
+
+    remove_initial_password_file_if_exists(request.app.state.server_config)
+
+
+@router.get("/config")
+async def get_auth_config(request: Request):
+    req_dict = {}
+    config: Config = request.app.state.server_config
+
+    auth_type = (config.external_auth_type or "Local").lower()
+    if auth_type == "oidc":
+        req_dict = {"is_oidc": True, "is_saml": False}
+    elif auth_type == "saml":
+        req_dict = {"is_oidc": False, "is_saml": True}
+
+    initial_password_file = Path(config.data_dir) / "initial_admin_password"
+    if initial_password_file.exists():
+        req_dict["first_time_setup"] = True
+        req_dict["get_initial_password_command"] = _get_initial_password_command(
+            initial_password_file
+        )
+
+    return req_dict
+
+
+def _get_initial_password_command(initial_password_file: Path) -> str:
+    """
+    Get the command to retrieve the initial admin password.
+    """
+    if os.getenv("KUBERNETES_SERVICE_HOST") is not None:
+        # Kubernetes
+        pod_name = os.getenv("HOSTNAME", "<pod_name>")
+        namespace_file = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+        namespace = (
+            namespace_file.read_text().strip()
+            if namespace_file.exists()
+            else "<namespace>"
+        )
+        return f"kubectl exec {pod_name} -n {namespace} -- cat {initial_password_file}"
+    elif Path("/.dockerenv").exists():
+        # Docker
+        return f"docker exec <container_name_or_id> cat {initial_password_file}"
+    else:
+        # Non-containerized
+        return f"cat {initial_password_file}"
+
+
+def remove_initial_password_file_if_exists(config: Config):
+    """
+    Remove the initial admin password file if it exists.
+    """
+    initial_password_file = Path(config.data_dir) / "initial_admin_password"
+    if initial_password_file.exists():
+        try:
+            initial_password_file.unlink()
+            logger.debug(f"Initial password file deleted: {initial_password_file}")
+        except Exception as e:
+            logger.warning(f"Failed to delete initial password file: {e}")

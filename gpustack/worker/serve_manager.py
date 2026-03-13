@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 from datetime import datetime, timezone
 import multiprocessing
+import threading
 
 import requests
 import setproctitle
@@ -11,7 +12,6 @@ import logging
 
 from gpustack_runtime.deployer import (
     get_workload,
-    list_workloads,
     WorkloadStatusStateEnum,
     delete_workload,
 )
@@ -19,7 +19,6 @@ from gpustack_runtime.deployer.__utils__ import compare_versions
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
-from gpustack import envs
 from gpustack.config import registration
 from gpustack.logging import (
     RedirectStdoutStderr,
@@ -27,7 +26,7 @@ from gpustack.logging import (
 from gpustack.schemas.inference_backend import InferenceBackend, is_built_in_backend
 from gpustack.utils import network, platform
 from gpustack.utils.attrs import set_attr
-from gpustack.utils.datetimex import parse_iso8601_to_utc
+from gpustack.utils.command import find_int_parameter
 from gpustack.utils.process import terminate_process_tree, add_signal_handlers
 from gpustack.worker.backends.ascend_mindie import AscendMindIEServer
 from gpustack.worker.backends.sglang import SGLangServer
@@ -52,6 +51,9 @@ from gpustack.server.bus import Event, EventType
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
 
 logger = logging.getLogger(__name__)
+
+# Global lock for port assignment to avoid pickle serialization issues
+_port_lock = threading.Lock()
 
 _SERVER_CLASS_MAPPING = {
     BackendEnum.VLLM: VLLMServer,
@@ -95,11 +97,6 @@ class ServeManager:
     When the (sub)process is alive, the model instance is provisioning.
     If the (sub)process exited, the model instance is either running or failed.
     """
-    _assigned_ports: Dict[int, Set[int]] = {}
-    """
-    The mapping of model instance ID to assigned ports.
-    Used to avoid port conflicts when assigning ports to new model instances.
-    """
     _error_model_instances: Dict[int, ModelInstance] = {}
     """
     The mapping of model instance ID to error model instances.
@@ -126,7 +123,28 @@ class ServeManager:
         self._serve_log_dir = f"{cfg.log_dir}/serve"
         self._clientset_getter = clientset_getter
 
+        # Instance-level port tracking to avoid conflicts
+        self._assigned_ports: Dict[int, Set[int]] = {}
+
         os.makedirs(self._serve_log_dir, exist_ok=True)
+
+    async def watch_models(self):
+        """
+        Loop to watch models to keep the cache updated.
+
+        """
+
+        logger.debug("Watching models.")
+
+        while True:
+            try:
+                # Watch models without callback to keep the cache updated.
+                await self._clientset.models.awatch(callback=None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error watching models: {e}")
+                await asyncio.sleep(5)
 
     async def watch_model_instances_event(self):
         """
@@ -235,7 +253,7 @@ class ServeManager:
                 # FIXME(thxCode): Another problem caused by skipping this check is that if we actively delete the workload on the subordinate worker,
                 #                 we may not be able to correct the state of the subordinate worker.
                 if not is_main_worker and not workload:
-                    return
+                    continue
                 # Only if not in ERROR state yet.
                 if model_instance.state != ModelInstanceStateEnum.ERROR:
                     with contextlib.suppress(NotFoundException):
@@ -266,10 +284,15 @@ class ServeManager:
                             }
                         # Update model instance.
                         self._update_model_instance(model_instance.id, **patch_dict)
-                return
+                continue
 
             # Otherwise, update model instance state to RUNNING if everything is fine.
             model = self._get_model(model_instance)
+            if not model.backend_version:
+                # backend version may be empty on initialization.
+                # try to refresh to get updated model info on syncs.
+                model = self._refresh_model(model_instance)
+
             backend = get_backend(model)
             health_check_path = self._get_health_check_path(backend)
             if model.env and 'GPUSTACK_MODEL_HEALTH_CHECK_PATH' in model.env:
@@ -307,13 +330,14 @@ class ServeManager:
                             "state_message": "",
                         }
 
-                        # Fetch model meta once running.
-                        meta = get_meta_from_running_instance(
-                            model_instance, backend, model
-                        )
-                        if meta and meta != model.meta:
-                            model_patch_dict = {"meta": meta}
-                            self._update_model(model.id, **model_patch_dict)
+                        if not model.meta:
+                            # Fetch model meta once running.
+                            meta = get_meta_from_running_instance(
+                                model_instance, backend, model
+                            )
+                            if meta:
+                                model_patch_dict = {"meta": meta}
+                                self._update_model(model.id, **model_patch_dict)
                     # Otherwise, update the main worker state to ERROR.
                     else:
                         patch_dict = {
@@ -349,29 +373,6 @@ class ServeManager:
                     }
                 # Update model instance.
                 self._update_model_instance(model_instance.id, **patch_dict)
-
-    def cleanup_orphan_workloads(self):
-        current_instance_names = set()
-        model_instances_page = self._clientset.model_instances.list()
-        if model_instances_page.items:
-            for model_instance in model_instances_page.items:
-                deployment_metadata = model_instance.get_deployment_metadata(
-                    self._worker_id,
-                )
-                if deployment_metadata:
-                    current_instance_names.add(deployment_metadata.name)
-
-        workloads = list_workloads()
-        for w in workloads:
-            create_at = parse_iso8601_to_utc(w.created_at)
-            should_clean_orphan, _ = network.is_offline(
-                create_at, envs.WORKER_ORPHAN_WORKLOAD_CLEANUP_GRACE_PERIOD
-            )
-            if w.name not in current_instance_names and should_clean_orphan:
-                delete_workload(w.name)
-                logger.info(
-                    f"Deleted orphan workload {w.name}, created at {w.created_at}."
-                )
 
     @staticmethod
     def _serve_model_instance(
@@ -557,7 +558,7 @@ class ServeManager:
             mi: The model instance to start.
 
         """
-        if mi.id in self._provisioning_processes:
+        if self._is_provisioning(mi):
             logger.warning(f"Model instance {mi.name} is provisioning. Skipping start.")
             return
 
@@ -585,28 +586,7 @@ class ServeManager:
             model = self._get_model(mi)
             backend = get_backend(model)
 
-            # Assign port.
-            if not mi.port:
-                if self._assigned_ports:
-                    unavailable_ports = set.union(*self._assigned_ports.values())
-                else:
-                    unavailable_ports = set()
-                mi.port = network.get_free_port(
-                    port_range=self._config.service_port_range,
-                    unavailable_ports=unavailable_ports,
-                )
-                mi.ports = [mi.port]
-                if (
-                    mi.distributed_servers
-                    and mi.distributed_servers.subordinate_workers
-                ):
-                    # Get port for subordinate workers' communication.
-                    unavailable_ports.add(mi.port)
-                    connecting_port = network.get_free_port(
-                        port_range=self._config.service_port_range,
-                        unavailable_ports=unavailable_ports,
-                    )
-                    mi.ports.append(connecting_port)
+            self._assign_ports(mi, model, backend)
 
             logger.debug(
                 f"Starting model instance {mi.name}"
@@ -637,7 +617,6 @@ class ServeManager:
             process.daemon = False
             process.start()
             self._provisioning_processes[mi.id] = process
-            self._assigned_ports[mi.id] = set(mi.ports)
 
             # Get patch dict for main worker.
             if is_main_worker:
@@ -690,6 +669,76 @@ class ServeManager:
             self._update_model_instance(mi.id, **patch_dict)
             logger.error(f"Failed to start model instance {mi.name}: {e}")
 
+    def _assign_ports(
+        self,
+        mi: ModelInstance,
+        model: Model,
+        backend: BackendEnum,
+    ) -> None:
+        """
+        Assign ports to the model instance.
+
+        This method is thread-safe and allocates ports for:
+        - Main serving port
+        - RPC port for vLLM DP communication (if applicable)
+        - Connecting port for subordinate workers (if applicable)
+
+        Args:
+            mi: The model instance to assign ports to.
+            model: The model associated with the instance.
+            backend: The backend type (e.g., vLLM, SGLang).
+        """
+        if mi.port:
+            # Port already assigned, skip.
+            return
+
+        with _port_lock:
+            if mi.port:
+                # Port already assigned, skip.
+                return
+
+            if self._assigned_ports:
+                unavailable_ports = set.union(*self._assigned_ports.values())
+            else:
+                unavailable_ports = set()
+
+            # Main serving port
+            mi.port = network.get_free_port(
+                port_range=self._config.service_port_range,
+                unavailable_ports=unavailable_ports,
+                host=mi.worker_ip,
+            )
+            mi.ports = [mi.port]
+            unavailable_ports.add(mi.port)
+
+            # Additional ports for distributed servers
+            if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
+                # RPC port for DP communication in vLLM backend
+                if backend == BackendEnum.VLLM:
+                    dps = find_int_parameter(
+                        model.backend_parameters,
+                        ["data-parallel-size", "dp"],
+                    )
+                    if dps and dps > 1:
+                        dp_connecting_port = network.get_free_port(
+                            port_range=self._config.service_port_range,
+                            unavailable_ports=unavailable_ports,
+                            host=mi.worker_ip,
+                        )
+                        mi.ports.append(dp_connecting_port)
+                        unavailable_ports.add(dp_connecting_port)
+
+                # Connecting port for subordinate workers communication
+                connecting_port = network.get_free_port(
+                    port_range=self._config.service_port_range,
+                    unavailable_ports=unavailable_ports,
+                    host=mi.worker_ip,
+                )
+                mi.ports.append(connecting_port)
+                unavailable_ports.add(connecting_port)
+
+            self._assigned_ports[mi.id] = set(mi.ports)
+
     def _restart_model_instance(self, mi: ModelInstance):
         """
         Restart model instance.
@@ -710,13 +759,16 @@ class ServeManager:
             **kwargs: The fields to update, group by field name and value.
         """
 
-        m_public = self._clientset.models.get(id=id)
+        try:
+            m_public = self._clientset.models.get(id=id)
 
-        m = ModelUpdate(**m_public.model_dump())
-        for key, value in kwargs.items():
-            set_attr(m, key, value)
+            m = ModelUpdate(**m_public.model_dump())
+            for key, value in kwargs.items():
+                set_attr(m, key, value)
 
-        self._clientset.models.update(id=id, model_update=m)
+            self._clientset.models.update(id=id, model_update=m)
+        except NotFoundException:
+            logger.warning(f"Model with ID {id} not found when trying to update.")
 
     def _update_model_instance(self, id: int, **kwargs):
         """
@@ -727,13 +779,18 @@ class ServeManager:
             **kwargs: The fields to update, group by field name and value.
         """
 
-        mi_public = self._clientset.model_instances.get(id=id)
+        try:
+            mi_public = self._clientset.model_instances.get(id=id)
 
-        mi = ModelInstanceUpdate(**mi_public.model_dump())
-        for key, value in kwargs.items():
-            set_attr(mi, key, value)
+            mi = ModelInstanceUpdate(**mi_public.model_dump())
+            for key, value in kwargs.items():
+                set_attr(mi, key, value)
 
-        self._clientset.model_instances.update(id=id, model_update=mi)
+            self._clientset.model_instances.update(id=id, model_update=mi)
+        except NotFoundException:
+            logger.warning(
+                f"Model instance with ID {id} not found when trying to update."
+            )
 
     def _stop_model_instance(self, mi: ModelInstance):
         """
@@ -822,6 +879,21 @@ class ServeManager:
         self._model_cache_by_instance[mi.id] = model
         return model
 
+    def _refresh_model(self, mi: ModelInstance) -> Model:
+        """
+        Refresh the model information from the server.
+
+        Args:
+            mi: The model instance whose model to refresh.
+
+        Returns:
+            The refreshed model.
+        """
+        logger.debug(f"Refreshing model {mi.model_name} information from server.")
+        refreshed_model = self._clientset.models.get(mi.model_id)
+        self._model_cache_by_instance[mi.id] = refreshed_model
+        return refreshed_model
+
     def _is_provisioning(self, mi: ModelInstance) -> bool:
         """
         Check if the model instance is still provisioning.
@@ -848,6 +920,27 @@ class ServeManager:
 
         return inference_backend.health_check_path if inference_backend else None
 
+    def get_instance_port_by_model_instance_id(
+        self, model_instance_id: int
+    ) -> Optional[int]:
+        """
+        Get the port of the model instance related to the given model instance ID.
+
+        Args:
+            model_instance_id: The model instance ID to get the port for.
+
+        Returns:
+            The port of the model instance if it exists and is running, else None.
+        """
+        instance = self._model_instance_by_instance_id.get(
+            model_instance_id
+        )  # Ensure the model instance is cached.
+        return (
+            instance.port
+            if instance and instance.state == ModelInstanceStateEnum.RUNNING
+            else None
+        )
+
 
 def is_ready(
     backend: str,
@@ -872,10 +965,14 @@ def is_ready(
         and model
         and CategoryEnum.IMAGE in model.categories
     ):
-        # SGLang Diffusion supported health check path at v0.5.5.post3
-        if compare_versions(model.backend_version, "0.5.5.post3") >= 0:
+        if not model.backend_version:
+            # version may be empty at initialization, consider it not ready.
+            return False
+        elif compare_versions(model.backend_version, "0.5.5.post3") >= 0:
+            # SGLang Diffusion supported health check path at v0.5.5.post3
             health_check_path = "/health"
         else:
+            # Older versions do not support health check, consider it always ready.
             return True
     elif is_built_in and backend != BackendEnum.CUSTOM and not health_check_path:
         # Built-in backends (vLLM, SGLang, vox-box) except (Custom, MindIE) use /v1/models as health check path.

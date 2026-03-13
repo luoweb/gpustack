@@ -96,17 +96,6 @@ sudo docker run -d --name gpustack \
 
 ## Installation via Docker Compose
 
-This guide explains how to deploy GPUStack and observability components (Prometheus, Grafana) using Docker Compose.
-
-
-### Overview of Services
-
-**Services:**
-
-- **gpustack-server**: Central server for scheduling, management, and built-in inference.
-- **prometheus**: Metrics collection.
-- **grafana**: Metrics visualization.
-
 ### Prerequisites
 
 - [Docker Compose](https://docs.docker.com/compose/install/) must be installed.
@@ -114,9 +103,24 @@ This guide explains how to deploy GPUStack and observability components (Prometh
 
 ### Deployment
 
-Get the latest Docker Compose file from the [GPUStack GitHub repository](https://github.com/gpustack/gpustack/blob/v2.0.1/docker-compose/docker-compose.server.yaml).
+The Docker Compose files and configuration files are maintained in the [GPUStack repository](https://github.com/gpustack/gpustack/tree/main/docker-compose).
 
-Run the following command to start the GPUStack server and observability components:
+Run the following commands to clone the latest stable release:
+
+```bash
+LATEST_TAG=$(
+    curl -s "https://api.github.com/repos/gpustack/gpustack/releases" \
+    | grep '"tag_name"' \
+    | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' \
+    | grep -Ev 'rc|beta|alpha|preview' \
+    | head -1
+)
+echo "Latest stable release: $LATEST_TAG"
+git clone -b "$LATEST_TAG" https://github.com/gpustack/gpustack.git
+cd gpustack/docker-compose
+```
+
+Start the GPUStack server:
 
 ```bash
 sudo docker compose -f docker-compose.server.yaml up -d
@@ -129,3 +133,5 @@ Log in with username `admin` and the default password. Retrieve the initial pass
 ```bash
 sudo docker exec -it gpustack-server cat /var/lib/gpustack/initial_admin_password
 ```
+
+For built-in and external observability options, see [Observability](../user-guide/observability.md).

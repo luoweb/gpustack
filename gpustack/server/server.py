@@ -17,10 +17,12 @@ from gpustack.schemas.users import (
     get_default_cluster_user,
     default_cluster_user_name,
 )
+from gpustack.schemas.models import ModelInstance
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.workers import Worker
 from gpustack.schemas.clusters import Cluster, ClusterProvider, ClusterStateEnum
-from gpustack.schemas.models import Model
+from gpustack.schemas.model_routes import ModelRoute, ModelRouteTarget
+from gpustack.schemas.model_provider import ModelProvider
 from gpustack.security import (
     JWTManager,
     generate_secure_password,
@@ -28,7 +30,8 @@ from gpustack.security import (
     API_KEY_PREFIX,
 )
 from gpustack.server.app import create_app
-from gpustack.config.config import Config, GatewayModeEnum
+from gpustack.config.config import Config
+from gpustack.schemas.config import GatewayModeEnum
 from gpustack.config import registration
 from gpustack.server.catalog import init_model_catalog
 from gpustack.server.controllers import (
@@ -39,22 +42,39 @@ from gpustack.server.controllers import (
     ClusterController,
     WorkerPoolController,
     InferenceBackendController,
+    ModelRouteController,
+    ModelRouteTargetController,
+    ModelProviderController,
 )
-from gpustack.server.db import get_engine, init_db
+from gpustack.server.db import async_session
+from gpustack.server.init_db import init_db, get_query_count
 from gpustack.scheduler.scheduler import Scheduler
 from gpustack.server.system_load import SystemLoadCollector
 from gpustack.server.update_check import UpdateChecker
 from gpustack.server.usage_buffer import flush_usage_to_db
+from gpustack.server.worker_status_buffer import flush_worker_status_to_db
 from gpustack.server.worker_instance_cleaner import WorkerInstanceCleaner
 from gpustack.server.worker_syncer import WorkerSyncer
 from gpustack.server.metrics_collector import GatewayMetricsCollector
 from gpustack.utils.process import add_signal_handlers_in_loop
 from gpustack.config.registration import write_registration_token
 from gpustack.exporter.exporter import MetricExporter
-from gpustack.gateway.utils import cleanup_orphaned_model_ingresses
+from gpustack.gateway.utils import (
+    model_ingress_prefix,
+    model_route_ingress_prefix,
+    model_route_ingress_name,
+    fallback_ingress_name,
+    cleanup_ingresses,
+    cleanup_model_mapper,
+    cleanup_fallback_filters,
+    cleanup_ai_proxy_config,
+    cleanup_mcpbridge_registry,
+)
+from gpustack.gateway import get_async_k8s_config
 from gpustack.envs import (
     GATEWAY_PORT_CHECK_INTERVAL,
     GATEWAY_PORT_CHECK_RETRY_COUNT,
+    DEFAULT_CLUSTER_KUBERNETES,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,9 +118,11 @@ class Server:
         self._start_worker_syncer()
         self._start_update_checker()
         self._start_model_usage_flusher()
+        self._start_worker_status_flusher()
         self._start_worker_instance_cleaner()
         self._start_metrics_exporter()
         self._start_gateway_metrics_collector()
+        self._start_query_count_logger()
         self._start_default_registry_checker()
 
         jwt_manager = JWTManager(self._config.jwt_secret_key)
@@ -190,8 +212,7 @@ class Server:
 
         await init_db(self._config.get_database_url())
 
-        engine = get_engine()
-        async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with async_session() as session:
             await self._init_data(session)
 
         logger.debug("Data initialization completed.")
@@ -203,6 +224,15 @@ class Server:
         logger.debug("Scheduler started.")
 
     def _start_controllers(self):
+        model_provider_controller = ModelProviderController(self._config)
+        self._create_async_task(model_provider_controller.start())
+
+        model_route_target_controller = ModelRouteTargetController(self._config)
+        self._create_async_task(model_route_target_controller.start())
+
+        model_route_controller = ModelRouteController(self._config)
+        self._create_async_task(model_route_controller.start())
+
         model_controller = ModelController(self._config)
         self._create_async_task(model_controller.start())
 
@@ -243,6 +273,11 @@ class Server:
 
         logger.debug("Model usage flusher started.")
 
+    def _start_worker_status_flusher(self):
+        self._create_async_task(flush_worker_status_to_db())
+
+        logger.debug("Worker status flusher started.")
+
     def _start_worker_instance_cleaner(self):
         worker_instance_cleaner = WorkerInstanceCleaner()
         self._create_async_task(worker_instance_cleaner.start())
@@ -250,7 +285,10 @@ class Server:
         logger.debug("Worker instance cleaner started.")
 
     def _start_gateway_metrics_collector(self):
-        if self._config.gateway_mode != GatewayModeEnum.embedded:
+        if self._config.gateway_mode not in [
+            GatewayModeEnum.embedded,
+            GatewayModeEnum.external,
+        ]:
             return
         collector = GatewayMetricsCollector(cfg=self._config)
 
@@ -329,6 +367,17 @@ class Server:
         self._create_async_task(exporter.generate_metrics_cache())
         self._create_async_task(exporter.start())
 
+    def _start_query_count_logger(self):
+        """Start a background task to log query count periodically."""
+
+        async def log_query_count():
+            while True:
+                await asyncio.sleep(60)  # Log every minute
+                count = get_query_count()
+                logger.debug(f"[DB QUERY COUNT] Total queries since startup: {count}")
+
+        self._create_async_task(log_query_count())
+
     @staticmethod
     def _setup_data_dir(data_dir: str):
         if not os.path.exists(data_dir):
@@ -376,7 +425,7 @@ class Server:
             await User.create(session, user)
 
     async def _migrate_legacy_token(self, session: AsyncSession):
-        if not self._config.token or self._config.token.startswith(API_KEY_PREFIX):
+        if not self._config.token:
             return
         # this should be created from sql migration script.
         cluster_user = await get_default_cluster_user(session)
@@ -424,7 +473,7 @@ class Server:
             await session.commit()
         except Exception as e:
             logger.error(f"Failed to migrate legacy token: {e}")
-            session.rollback()
+            await session.rollback()
             raise e
 
     async def _migrate_legacy_workers(self, session: AsyncSession):
@@ -493,7 +542,7 @@ class Server:
                 logger.error(
                     f"Failed to migrate worker {worker.id} ({worker.name}): {e}"
                 )
-                session.rollback()
+                await session.rollback()
                 raise e
 
     async def _ensure_registration_token(self, session: AsyncSession):
@@ -526,7 +575,7 @@ class Server:
                 await session.commit()
             except Exception as e:
                 logger.error(f"Failed to ensure registration token: {e}")
-                session.rollback()
+                await session.rollback()
                 raise e
 
         write_registration_token(
@@ -537,35 +586,110 @@ class Server:
     async def _cleanup_orphaned_gateway_data(self, session: AsyncSession):
         if self.config.gateway_mode == GatewayModeEnum.disabled:
             return
-        # Remove the orphaned ingresses of model
-        models = await Model.all_by_field(
+        # Remove the orphaned ingresses of model routes
+        model_routes = await ModelRoute.all_by_field(
             session=session, field="deleted_at", value=None
         )
-        model_ids = [model.id for model in models]
-        k8s_config = self.config.get_async_k8s_config()
-        await cleanup_orphaned_model_ingresses(
-            namespace=self.config.get_gateway_namespace(),
-            existing_model_ids=model_ids,
+        route_targets = await ModelRouteTarget.all_by_fields(
+            session=session,
+            fields={"deleted_at": None},
+        )
+        providers = await ModelProvider.all_by_fields(
+            session=session,
+            fields={"deleted_at": None},
+        )
+        model_instances = await ModelInstance.all_by_fields(
+            session=session,
+            fields={"deleted_at": None},
+        )
+        workers = await Worker.all_by_fields(
+            session=session,
+            fields={"deleted_at": None},
+        )
+        fallback_route_ids = [
+            ep.route_id
+            for ep in route_targets
+            if ep.fallback_status_codes is not None
+            and len(ep.fallback_status_codes) > 0
+        ]
+        expected_ingress_names = [
+            model_route_ingress_name(model_route.id) for model_route in model_routes
+        ]
+        expected_names = expected_ingress_names + [
+            fallback_ingress_name(model_route_ingress_name(id))
+            for id in fallback_route_ids
+        ]
+
+        k8s_config = get_async_k8s_config(cfg=self.config)
+        await cleanup_ingresses(
+            namespace=self.config.get_namespace(),
+            expected_names=expected_names,
+            config=k8s_config,
+            cleanup_prefix=model_route_ingress_prefix,
+            reason="orphaned",
+        )
+        await cleanup_ingresses(
+            namespace=self.config.get_namespace(),
+            expected_names=expected_names,
+            config=k8s_config,
+            cleanup_prefix=model_ingress_prefix,
+            reason="legacy",
+        )
+        await cleanup_model_mapper(
+            namespace=self.config.gateway_namespace,
+            expected_ingresses=expected_ingress_names,
             config=k8s_config,
         )
+        await cleanup_fallback_filters(
+            namespace=self.config.get_namespace(),
+            expected_names=expected_names,
+            cleanup_prefix=model_route_ingress_prefix,
+            reason="orphaned",
+            k8s_config=k8s_config,
+        )
+        await cleanup_ai_proxy_config(
+            namespace=self.config.gateway_namespace,
+            providers=providers,
+            routes=model_routes,
+            k8s_config=k8s_config,
+        )
+        await cleanup_mcpbridge_registry(
+            providers=providers,
+            namespace=self.config.gateway_namespace,
+            model_instances=model_instances,
+            workers=workers,
+            k8s_config=k8s_config,
+        )
+
+    def _should_create_default_cluster(self) -> bool:
+        # only server or both will get into this logic
+        if self._config.server_role() == Config.ServerRole.BOTH:
+            return True
+        if self._config.token:
+            return True
+        return False
 
     async def _init_default_cluster(self, session: AsyncSession):
-        if self._config.server_role() != Config.ServerRole.BOTH:
+        if not self._should_create_default_cluster():
             return
         default_cluster_user = await get_default_cluster_user(session)
         if default_cluster_user:
             return
-        logger.info(
-            "Creating default cluster due to running in Server and Worker mode."
-        )
+        user_defined_default_cluster = await self.user_defined_default_cluster(session)
+        set_default = user_defined_default_cluster is None
+        logger.info("Creating default cluster...")
+        provider = ClusterProvider.Docker
+        if DEFAULT_CLUSTER_KUBERNETES:
+            provider = ClusterProvider.Kubernetes
         hashed_suffix = secrets.token_hex(6)
         default_cluster = Cluster(
             name="Default Cluster",
             description="The default cluster for GPUStack",
-            provider=ClusterProvider.Docker,
+            provider=provider,
             state=ClusterStateEnum.READY,
             hashed_suffix=hashed_suffix,
             registration_token="",
+            is_default=set_default,
         )
         default_cluster = await Cluster.create(
             session, default_cluster, auto_commit=False
@@ -584,3 +708,9 @@ class Server:
 
         await session.commit()
         logger.debug("Default cluster created.")
+
+    async def user_defined_default_cluster(self, session: AsyncSession) -> Cluster:
+        cluster = await Cluster.first_by_field(
+            session=session, field="is_default", value=True
+        )
+        return cluster

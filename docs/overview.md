@@ -13,7 +13,7 @@
   <a href="https://discord.gg/VXYJzuaqwD" target="_blank">
     <img alt="Discord" src="https://img.shields.io/badge/Discord-GPUStack-blue?logo=discord&logoColor=white">
   </a>
-  <a href="../assets/docs-wechat-group-qrcode.jpg" target="_blank">
+  <a href="https://github.com/gpustack/gpustack/blob/main/docs/assets/wechat-group-qrcode.jpg" target="_blank">
     <img alt="WeChat" src="https://img.shields.io/badge/微信群-GPUStack-blue?logo=wechat&logoColor=white">
   </a>
 </p>
@@ -55,8 +55,9 @@ GPUStack uses a plug-in architecture that makes it easy to add new AI models, in
 - Qwen3
 - gpt-oss
 - GLM-4.5-Air
-- GLM-4.5/4.6
+- GLM-4.x
 - DeepSeek-R1
+- DeepSeek-V3.2
 
 ## Architecture
 

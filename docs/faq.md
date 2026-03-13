@@ -2,7 +2,7 @@
 
 ## Support Matrix
 
-### Hybird Cluster Support
+### Hybrid Cluster Support
 
 GPUStack supports heterogeneous clusters spanning NVIDIA, AMD, Ascend, Hygon, Moore Threads, Iluvatar, MetaX, and Cambricon GPUs, and works across both AMD64 and ARM64 architectures.
 
@@ -130,7 +130,9 @@ sudo docker run -d --name gpustack \
 
 ### How can I deploy the model from Local Path?
 
-When deploying models from Local Path, it is recommended to **upload the model files to each node** and **maintain the same absolute path**.
+When deploying models from Local Path, ensure the model path is accessible on the target workers.
+
+If the model is stored on a specific worker, you can use the worker selector to deploy the model to that worker.
 
 Another option is to mount a shared storage across multiple nodes.
 
@@ -180,6 +182,24 @@ Try restarting the GPUStack container where the model is scheduled. If the issue
 
 Move the mouse over the `Error` status to view the reason. If there is a `View More` button, click it to check the error messages in the model logs and analyze the cause of the error.
 
+### Why does the model fail to start when using a custom backend version based on the official vLLM image with `PYPI_PACKAGES_INSTALL`?
+
+When deploying a model using a custom vLLM backend version based on the official vLLM image, the model may fail to start if `PYPI_PACKAGES_INSTALL` is used to install additional Python packages.
+
+You may see an error similar to:
+
+```bash
+/gpustack-command-xxxxxxxx: 40: /path/to/your_model: Permission denied
+```
+
+This happens because the container starts with a custom command instead of the image’s default entrypoint.
+
+In `Inference Backends` → `vLLM` → `Edit` → `Versions Config`, edit the corresponding version and set Override Image Entrypoint to:
+
+```bash
+vllm serve
+```
+
 ### Why doesn’t deleting a model free up disk space?
 
 This is to avoid re-downloading the model when redeploying. You need to clean it up in `Model Files` manually.
@@ -200,15 +220,13 @@ This is a limitation of vLLM. You can adjust the `--limit-mm-per-prompt` paramet
 
 We recommend passing standard proxy environment variables when running GPUStack.
 
-!!! warning "**Important Note on `NO_PROXY`:**"
-
-    Some libraries don't support CIDR in the NO_PROXY environment variable. Instead, you should explicitly specify domain suffixes or individual IP addresses.
-
 The following case demonstrates how to configure GPUStack to forward all requests to the target proxy, except for requests to addresses specified in the NO_PROXY environment variable.
 
 ```bash
 docker run -d --name gpustack \
     -e HTTPS_PROXY="http://proxy-server:port" \
+    -e HTTP_PROXY="http://proxy-server:port" \
+    -e NO_PROXY="127.0.0.1,10.0.0.0/8,192.168.0.0/16,172.16.0.0/16,localhost,cluster.local" \
     ...
 ```
 

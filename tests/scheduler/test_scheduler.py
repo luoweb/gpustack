@@ -197,7 +197,7 @@ async def test_evaluate_pretrained_config(
                 huggingface_repo_id="google-t5/t5-base",
                 backend=BackendEnum.VLLM,
                 backend_parameters=[],
-                env={"GPUSTACK_MODEL_EVALUATION_SKIP": "1"},
+                env={"GPUSTACK_SKIP_MODEL_EVALUATION": "1"},
             ),
             True,
             [],
@@ -209,7 +209,9 @@ async def test_evaluate_model_metadata(
     config, case_name, model, expect_compatible, expect_error_match
 ):
     try:
-        actual_compatible, actual_error = await evaluate_model_metadata(config, model)
+        actual_compatible, actual_error = await evaluate_model_metadata(
+            config, model, []
+        )
         assert (
             actual_compatible == expect_compatible
         ), f"Expected compatibility: {expect_compatible}, but got: {actual_compatible}. Error: {actual_error}"

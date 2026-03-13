@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, Optional, Any
+from typing import ClassVar, Dict, Optional, Any
 from pydantic import ConfigDict, BaseModel
 from sqlmodel import (
     Field,
@@ -15,12 +15,21 @@ from sqlmodel import (
 from sqlalchemy import String
 from gpustack import envs
 from gpustack.mixins import BaseModelMixin
-from gpustack.schemas.common import PaginatedList, UTCDateTime, pydantic_column_type
+from gpustack.schemas.common import (
+    ListParams,
+    PaginatedList,
+    UTCDateTime,
+    pydantic_column_type,
+)
 from typing import List
 from sqlalchemy.orm import declarative_base
 
 from gpustack.utils.network import is_offline
 from .clusters import ClusterProvider, Cluster, WorkerPool
+from gpustack.schemas.config import (
+    PredefinedConfigNoDefaults,
+    ModelInstanceProxyModeEnum,
+)
 
 Base = declarative_base()
 
@@ -110,6 +119,9 @@ class GPUDeviceInfo(BaseModel):
     """
     Compute compatibility version of the GPU device, e.g. for NVIDIA GPUs.
     """
+
+
+class GPUDeviceStatus(GPUDeviceInfo):
     core: Optional[GPUCoreInfo] = Field(sa_column=Column(JSON), default=None)
     """
     Core information of the GPU device.
@@ -128,7 +140,7 @@ class GPUDeviceInfo(BaseModel):
     """
 
 
-GPUDevicesInfo = List[GPUDeviceInfo]
+GPUDevicesStatus = List[GPUDeviceStatus]
 
 
 class MountPoint(BaseModel):
@@ -219,21 +231,6 @@ class WorkerStateEnum(str, Enum):
         ]
 
 
-class ModelInstanceProxyModeEnum(str, Enum):
-    """
-    ModelInstanceProxyModeEnum 的 Docstring
-
-    Enum for Model Instance Proxy Mode
-    WORKER - Proxy through the worker
-    DIRECT - Direct access to the model instance
-    DELEGATED - Preserved for proxying through cluster gateway (not implemented yet)
-    """
-
-    WORKER = "worker"
-    DIRECT = "direct"
-    DELEGATED = "delegated"
-
-
 class SystemInfo(BaseModel):
     cpu: Optional[CPUInfo] = Field(sa_column=Column(JSON), default=None)
     memory: Optional[MemoryInfo] = Field(sa_column=Column(JSON), default=None)
@@ -254,7 +251,9 @@ class WorkerStatus(SystemInfo):
     rpc_servers: Deprecated
     """
 
-    gpu_devices: Optional[GPUDevicesInfo] = Field(sa_column=Column(JSON), default=None)
+    gpu_devices: Optional[GPUDevicesStatus] = Field(
+        sa_column=Column(JSON), default=None
+    )
     rpc_servers: Optional[Dict[int, RPCServer]] = Field(
         sa_column=Column(JSON), default=None
     )
@@ -276,6 +275,7 @@ class WorkerStatus(SystemInfo):
 
 
 class WorkerStatusStored(BaseModel):
+    advertise_address: Optional[str] = None
     hostname: str
     ip: str
     ifname: str
@@ -283,7 +283,7 @@ class WorkerStatusStored(BaseModel):
     metrics_port: Optional[int] = None
 
     system_reserved: Optional[SystemReserved] = Field(
-        sa_column=Column(pydantic_column_type(SystemReserved))
+        default=None, sa_column=Column(pydantic_column_type(SystemReserved))
     )
     state_message: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
@@ -366,7 +366,8 @@ class WorkerBase(WorkerCreate):
             return
 
         if self.unreachable:
-            healthz_url = f"http://{self.ip}:{self.port}/healthz"
+            address = self.advertise_address or self.ip
+            healthz_url = f"http://{address}:{self.port}/healthz"
             msg = (
                 "Server cannot access the "
                 f"worker's health check endpoint at {healthz_url}. "
@@ -400,10 +401,10 @@ class Worker(WorkerBase, BaseModelMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
 
     cluster: Cluster = Relationship(
-        back_populates="cluster_workers", sa_relationship_kwargs={"lazy": "selectin"}
+        back_populates="cluster_workers", sa_relationship_kwargs={"lazy": "noload"}
     )
     worker_pool: Optional[WorkerPool] = Relationship(
-        back_populates="pool_workers", sa_relationship_kwargs={"lazy": "selectin"}
+        back_populates="pool_workers", sa_relationship_kwargs={"lazy": "noload"}
     )
 
     # This field should be replaced by x509 credential if mTLS is supported.
@@ -448,6 +449,19 @@ class Worker(WorkerBase, BaseModelMixin, table=True):
         return False
 
 
+class WorkerListParams(ListParams):
+    sortable_fields: ClassVar[List[str]] = [
+        "name",
+        "state",
+        "ip",
+        "status.cpu.utilization_rate",
+        "status.memory.utilization_rate",
+        "gpus",  # gpu count, the same naming pattern as in Clusters
+        "created_at",
+        "updated_at",
+    ]
+
+
 class WorkerPublic(
     WorkerBase,
 ):
@@ -463,6 +477,8 @@ class WorkerPublic(
 
 class WorkerRegistrationPublic(WorkerPublic):
     token: str
+    worker_uuid: str
+    worker_config: Optional["PredefinedConfigNoDefaults"] = None
 
 
 WorkersPublic = PaginatedList[WorkerPublic]

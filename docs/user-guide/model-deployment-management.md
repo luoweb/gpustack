@@ -44,8 +44,8 @@ You can deploy a model from a local path. The model path can be a directory (e.g
 
 !!! note
 
-    1. GPUStack does not check the validity of the model path for scheduling, which may lead to deployment failure if the model path is inaccessible. It is recommended to ensure the model path is accessible on all workers(e.g., using NFS, rsync, etc.). You can also use the worker selector configuration to deploy the model to specific workers.
-    2. GPUStack cannot evaluate the model's resource requirements unless the server has access to the same model path. Consequently, you may observe empty VRAM/RAM allocations for a deployed model. To mitigate this, it is recommended to make the model files available on the same path on the server. Alternatively, you can customize backend parameters, such as `tensor-split`, to configure how the model is distributed across the GPUs.
+    1. GPUStack uses the model files to estimate resource requirements. If the model path is not accessible on the server, GPUStack will attempt to access it from the workers.
+    2. GPUStack does not automatically synchronize model files. You must ensure the model path is accessible on the target workers (e.g., using NFS, rsync, etc.). You can also use the worker selector configuration to deploy the model to specific workers.
 
 To deploy a local path model:
 
@@ -230,7 +230,7 @@ When CPU offloading is enabled, GPUStack will allocate CPU memory if GPU resourc
 
 Enable distributed inference across multiple workers. The primary Model Instance will communicate with backend instances on one or more other workers, offloading computation tasks to them.
 
-### Auto-Restrat on Error
+### Auto-Restart on Error
 
 Enable automatic restart of the model instance if it encounters an error. This feature ensures high availability and reliability of the model instance. If an error occurs, GPUStack will automatically attempt to restart the model instance using an exponential backoff strategy. The delay between restart attempts increases exponentially, up to a maximum interval of 5 minutes. This approach prevents the system from being overwhelmed by frequent restarts in the case of persistent errors.
 

@@ -1,3 +1,5 @@
+import re
+import shlex
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -8,7 +10,15 @@ from sqlmodel import SQLModel, Field as SQLField
 
 from gpustack.mixins import BaseModelMixin
 from .common import pydantic_column_type, PaginatedList
-from .models import BackendEnum
+from .models import BackendEnum, BackendSourceEnum
+
+
+class ContainerEnvConfig(BaseModel):
+    """Container environment configuration."""
+
+    user: Optional[int] = None
+    group: Optional[int] = None
+    shm_size_gib: float = 10.0
 
 
 class VersionConfig(BaseModel):
@@ -18,14 +28,18 @@ class VersionConfig(BaseModel):
     Attributes:
         image_name: Docker image name for this version
         run_command: Command to run the inference server (Optional, uses default if not specified)
+        entrypoint: Container entrypoint command that overrides the default image entrypoint. (Optional)
         built_in_frameworks: Only built-in backend will return this field, sourced from gpustack-runner configuration. (Optional)
         custom_framework: User-provided value (upon backend creation) used for deployment and compatibility checks. (Optional)
+        env: Environment variables for this version (Optional, merges with default_env)
     """
 
     image_name: Optional[str] = Field(None)
     run_command: Optional[str] = Field(None)
+    entrypoint: Optional[str] = Field(None)
     built_in_frameworks: Optional[List[str]] = Field(None)
     custom_framework: Optional[str] = Field(None)
+    env: Optional[Dict[str, str]] = Field(None)
 
 
 class VersionConfigDict(RootModel[Dict[str, VersionConfig]]):
@@ -47,6 +61,7 @@ class InferenceBackendBase(SQLModel):
         default_version: Default version to use if not specified
         default_backend_param: Default parameters to pass to the backend
         default_run_command: Default command to run the inference server
+        default_entrypoint: Default entrypoint to replace for the inference server
         description: Backend description
         health_check_path: Path for health check endpoint
 
@@ -64,11 +79,20 @@ class InferenceBackendBase(SQLModel):
     default_run_command: Optional[str] = SQLField(
         sa_column=Column(Text, nullable=True), default=""
     )
+    default_entrypoint: Optional[str] = SQLField(
+        sa_column=Column(Text, nullable=True), default=""
+    )
     is_built_in: bool = SQLField(default=False)
     description: Optional[str] = SQLField(
         default=None, sa_column=Column(Text, nullable=True)
     )
     health_check_path: Optional[str] = SQLField(default=None)
+    backend_source: Optional[BackendSourceEnum] = SQLField(default=None)
+    enabled: Optional[bool] = SQLField(default=None)
+    icon: Optional[str] = SQLField(default=None)
+    default_env: Optional[Dict[str, str]] = SQLField(
+        sa_column=Column(JSON), default=None
+    )
 
     def resolve_target_version(self, version: Optional[str] = None) -> Optional[str]:
         """
@@ -130,6 +154,25 @@ class InferenceBackendBase(SQLModel):
         version_config, _ = self.get_version_config(version)
         return version_config.run_command or self.default_run_command
 
+    def get_backend_env(self, version: Optional[str] = None):
+        """
+        backend.version.env > backend.default_env
+        """
+        env_dict = {}
+        if self.default_env:
+            for k, v in self.default_env.items():
+                env_dict[k] = v
+        if version:
+            try:
+                version_config, _ = self.get_version_config(version)
+                if version_config.env:
+                    for k, v in version_config.env.items():
+                        env_dict[k] = v
+            except Exception:
+                # built-in version may not include version config
+                pass
+        return env_dict
+
     def replace_command_param(
         self,
         version: Optional[str],
@@ -138,17 +181,71 @@ class InferenceBackendBase(SQLModel):
         worker_ip: Optional[str] = None,
         model_name: Optional[str] = None,
         command: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
     ) -> str:
         if not command:
             command = self.get_run_command(version)
             if not command:
                 return ""
 
-        command = command.replace("{{model_path}}", model_path)
+        command = command.replace("{{model_path}}", model_path or "")
         command = command.replace("{{port}}", str(port))
-        command = command.replace("{{worker_ip}}", str(worker_ip))
-        command = command.replace("{{model_name}}", model_name)
+        command = command.replace("{{worker_ip}}", worker_ip or "")
+        command = command.replace("{{model_name}}", model_name or "")
+
+        # Resolve environment variables using {{VAR_NAME}} syntax
+        # Use provided env (from model) if available, otherwise fall back to backend env
+        if env:
+            command = self._resolve_env_vars(command, env)
+
         return command
+
+    def _resolve_env_vars(self, command: str, env_dict: Dict[str, str]) -> str:
+        """
+        Resolve {{VAR_NAME}} placeholders in the command string using the provided environment dict.
+
+        Args:
+            command: The command string with {{VAR_NAME}} placeholders
+            env_dict: Dictionary of environment variable names to values
+
+        Returns:
+            Command with placeholders replaced by their values.
+            If a variable is not found in env_dict, the placeholder is left unchanged.
+        """
+        # Match valid variable names: start with letter or underscore, followed by alphanumeric or underscore
+        pattern = r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}"
+
+        def replace_var(match):
+            var_name = match.group(1)
+            return env_dict.get(var_name, match.group(0))
+
+        return re.sub(pattern, replace_var, command)
+
+    def get_container_entrypoint(
+        self, version: Optional[str] = None
+    ) -> Optional[List[str]]:
+        """
+        Get container entrypoint for the specified version.
+
+        Args:
+            version: Desired backend version; falls back to `default_version` when None.
+
+        Returns:
+            The container entrypoint string, or None if not configured.
+        """
+        if self.backend_name == BackendEnum.CUSTOM.value:
+            return None
+        try:
+            # Resolve concrete version and fetch its configuration
+            version_config, _ = self.get_version_config(version)
+        except KeyError:
+            # Version not found or cannot be resolved
+            return None
+        entrypoint = version_config.entrypoint or self.default_entrypoint
+        if entrypoint:
+            return shlex.split(entrypoint)
+        else:
+            return None
 
     def get_image_name(self, version: Optional[str] = None) -> (str, str):
         """
@@ -169,14 +266,18 @@ class InferenceBackendBase(SQLModel):
         except KeyError:
             # Version not found or cannot be resolved
             return "", ""
+
+        if not version_config or not version_config.image_name:
+            return "", ""
+
         # Only return image for custom version configs (no built-in frameworks) with explicit image
         if (
-            version_config
-            and version_config.built_in_frameworks is None
-            and version_config.image_name
+            self.backend_source == BackendSourceEnum.BUILT_IN
+            and version_config.built_in_frameworks
         ):
-            return version_config.image_name, version
-        return "", ""
+            return "", ""
+
+        return version_config.image_name, version
 
 
 class InferenceBackend(InferenceBackendBase, BaseModelMixin, table=True):
@@ -187,6 +288,7 @@ class InferenceBackend(InferenceBackendBase, BaseModelMixin, table=True):
 class VersionListItem(BaseModel):
     version: str = Field(...)
     is_deprecated: bool = Field(default=False)
+    env: Optional[Dict[str, str]] = Field(None)
 
 
 class InferenceBackendListItem(BaseModel):
@@ -199,6 +301,9 @@ class InferenceBackendListItem(BaseModel):
     versions: Optional[List[VersionListItem]] = Field(
         None, description="Available versions for this backend"
     )
+    enabled: Optional[bool] = Field(None)
+    backend_source: Optional[BackendSourceEnum] = Field(None)
+    default_env: Optional[Dict[str, str]] = Field(None)
 
 
 class InferenceBackendResponse(BaseModel):
@@ -258,3 +363,22 @@ def is_built_in_backend(backend_name: Optional[str]) -> bool:
         backend.backend_name.lower() for backend in built_in_backends
     }
     return backend_name.lower() in built_in_backend_names
+
+
+def is_custom_backend(backend_name: Optional[str]) -> bool:
+    """
+    Check if a backend is a custom backend, i.e., not built-in or explicitly marked as CUSTOM.
+
+    Args:
+        backend_name: The name of the backend to check
+
+    Returns:
+        True if the backend is custom, False otherwise
+    """
+    if not backend_name:
+        return False
+
+    return (
+        not is_built_in_backend(backend_name)
+        or backend_name == BackendEnum.CUSTOM.value
+    )

@@ -1,10 +1,10 @@
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import ClassVar, List, Optional
 from sqlmodel import JSON, BigInteger, Column, Field, Relationship, SQLModel, Text
 
 from gpustack.mixins import BaseModelMixin
-from gpustack.schemas.common import PaginatedList
+from gpustack.schemas.common import ListParams, PaginatedList
 from gpustack.schemas.links import (
     ModelInstanceDraftModelFileLink,
     ModelInstanceModelFileLink,
@@ -40,7 +40,7 @@ class ModelFile(ModelFileBase, BaseModelMixin, table=True):
     source_index: Optional[str] = Field(index=True, unique=True, default=None)
 
     instances: list[ModelInstance] = Relationship(
-        sa_relationship_kwargs={"lazy": "selectin"},
+        sa_relationship_kwargs={"lazy": "noload"},
         back_populates="model_files",
         link_model=ModelInstanceModelFileLink,
     )
@@ -48,8 +48,19 @@ class ModelFile(ModelFileBase, BaseModelMixin, table=True):
     draft_instances: list[ModelInstance] = Relationship(
         back_populates="draft_model_files",
         link_model=ModelInstanceDraftModelFileLink,
-        sa_relationship_kwargs={"lazy": "selectin"},
+        sa_relationship_kwargs={"lazy": "noload"},
     )
+
+
+class ModelFileListParams(ListParams):
+    sortable_fields: ClassVar[List[str]] = [
+        "source",
+        "worker_id",
+        "state",
+        "resolved_paths",
+        "created_at",
+        "updated_at",
+    ]
 
 
 class ModelFileCreate(ModelFileBase):

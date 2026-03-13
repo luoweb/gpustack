@@ -21,7 +21,7 @@ async def test_provisioning_flow(monkeypatch):
     cluster = Cluster(
         id=1, provider=ClusterProvider.DigitalOcean, region="nyc3", credential_id=1
     )
-    cluster.state = ClusterStateEnum.READY
+    cluster.state = ClusterStateEnum.PROVISIONED
     pool = WorkerPool(
         id=1,
         cluster=cluster,
@@ -44,7 +44,7 @@ async def test_provisioning_flow(monkeypatch):
     credential = CloudCredential(id=1, token="dummy")
     cfg = MagicMock()
     cfg.server_external_url = "http://dummy-server"
-    cfg.get_image_name = lambda: "dummy-image"
+    cfg.image_name_override = "dummy-image"
     monkeypatch.setattr("gpustack.config.config.get_global_config", lambda: cfg)
     mock_sshkey = MagicMock()
     mock_sshkey.id = "ssh-key-id"
@@ -74,6 +74,9 @@ async def test_provisioning_flow(monkeypatch):
 
     client.get_instance = AsyncMock(return_value=mock_instance)
     client.create_ssh_key = AsyncMock(return_value="ssh-key-id")
+    mock_user_data = MagicMock()
+    mock_user_data.format.return_value = "#!/bin/bash\necho hello"
+    client.construct_user_data = AsyncMock(return_value=mock_user_data)
     client.create_instance = AsyncMock(return_value="instance-id")
     client.wait_for_started = AsyncMock(return_value={"id": "instance-id"})
     client.wait_for_public_ip = AsyncMock(

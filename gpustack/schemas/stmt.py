@@ -59,7 +59,7 @@ SELECT
     JSON_UNQUOTE(JSON_EXTRACT(gpu_device, '$.compute_capability')) AS `compute_capability`,
     JSON_EXTRACT(gpu_device, '$.core') AS `core`,
     JSON_EXTRACT(gpu_device, '$.memory') AS `memory`,
-    CAST(JSON_UNQUOTE(JSON_EXTRACT(gpu_device, '$.temperature')) AS DECIMAL(10, 2)) AS `temperature`,
+    CAST(COALESCE(JSON_VALUE(gpu_device, '$.temperature'), '0') AS DECIMAL(10, 2)) AS `temperature`,
     JSON_EXTRACT(gpu_device, '$.network') AS `network`
 FROM
     workers w,
@@ -124,11 +124,11 @@ SELECT
     m.*
 FROM
     users u
-INNER JOIN models m
+INNER JOIN model_routes as m
     ON m.access_policy in ('PUBLIC', 'AUTHED')
     OR EXISTS (
-        SELECT 1 FROM modeluserlink mul
-        WHERE mul.model_id = m.id AND mul.user_id = u.id
+        SELECT 1 FROM usermodelroutelink uml
+        WHERE uml.route_id = m.id AND uml.user_id = u.id
     )
 WHERE
     u.is_admin = {sql_false} AND u.is_system = {sql_false}

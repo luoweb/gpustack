@@ -1,4 +1,6 @@
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch
+
+from tests.utils.mock import mock_async_session
 
 import pytest
 
@@ -20,7 +22,7 @@ from tests.policies.candidate_selectors.vllm.test_vllm_resource_fit_selector imp
             [linux_nvidia_4_4080_16gx4()],
             make_model(1, None, "Qwen/Qwen2.5-Omni-7B"),
             [
-                '- The model requires approximately 25.99 GiB of VRAM and 2.6 GiB of RAM.\n'
+                '- The model requires approximately 26.99 GiB of VRAM and 2.7 GiB of RAM.\n'
                 '- The current available GPU only has 15.99 GiB allocatable VRAM.'
             ],
         ),
@@ -30,14 +32,14 @@ from tests.policies.candidate_selectors.vllm.test_vllm_resource_fit_selector imp
             make_model(
                 1,
                 [
-                    "host-4-4080:nvidia:0",
-                    "host-4-4080:nvidia:1",
-                    "host-4-4080:nvidia:2",
+                    "host-4-4080:cuda:0",
+                    "host-4-4080:cuda:1",
+                    "host-4-4080:cuda:2",
                 ],
                 "Qwen/Qwen3-8B",
             ),
             [
-                '- The model requires approximately 19.31 GiB of VRAM and 2.0 GiB of RAM.\n'
+                '- The model requires approximately 20.31 GiB of VRAM and 2.03 GiB of RAM.\n'
             ],
         ),
     ],
@@ -48,8 +50,10 @@ async def test_schedule_single_work_multi_gpu(
 ):
     m = model
 
-    resource_fit_selector = CustomBackendResourceFitSelector(config, m)
-    placement_scorer = PlacementScorer(m)
+    mis = []
+
+    resource_fit_selector = CustomBackendResourceFitSelector(config, m, mis)
+    placement_scorer = PlacementScorer(m, mis)
 
     if index == 1:
         # Simulate a scenario where the model's num_attention_heads cannot be evenly divided by the gpu_count through auto-scheduling.
@@ -57,17 +61,16 @@ async def test_schedule_single_work_multi_gpu(
 
     with (
         patch(
-            'gpustack.policies.utils.get_worker_model_instances',
-            return_value=[],
-        ),
-        patch(
-            'gpustack.policies.scorers.placement_scorer.get_model_instances',
-            return_value=[],
-        ),
-        patch('sqlmodel.ext.asyncio.session.AsyncSession', AsyncMock()),
-        patch(
             'gpustack.schemas.workers.Worker.all',
             return_value=workers,
+        ),
+        patch(
+            'gpustack.policies.worker_filters.backend_framework_filter.async_session',
+            return_value=mock_async_session(),
+        ),
+        patch(
+            'gpustack.policies.scorers.placement_scorer.async_session',
+            return_value=mock_async_session(),
         ),
     ):
 
@@ -106,22 +109,23 @@ async def test_failed_cases_auto_schedule(
 ):
     model.env = env_overrides
 
-    resource_fit_selector = CustomBackendResourceFitSelector(config, model)
-    placement_scorer = PlacementScorer(model)
+    mis = []
+
+    resource_fit_selector = CustomBackendResourceFitSelector(config, model, mis)
+    placement_scorer = PlacementScorer(model, mis)
 
     with (
         patch(
-            'gpustack.policies.utils.get_worker_model_instances',
-            return_value=[],
-        ),
-        patch(
-            'gpustack.policies.scorers.placement_scorer.get_model_instances',
-            return_value=[],
-        ),
-        patch('sqlmodel.ext.asyncio.session.AsyncSession', AsyncMock()),
-        patch(
             'gpustack.schemas.workers.Worker.all',
             return_value=workers,
+        ),
+        patch(
+            'gpustack.policies.worker_filters.backend_framework_filter.async_session',
+            return_value=mock_async_session(),
+        ),
+        patch(
+            'gpustack.policies.scorers.placement_scorer.async_session',
+            return_value=mock_async_session(),
         ),
     ):
         candidates = await resource_fit_selector.select_candidates(workers)

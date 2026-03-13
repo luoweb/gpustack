@@ -165,7 +165,7 @@ async def container_log_generator(model_instance_name: str, options: LogOptionsD
     """
     try:
         # Convert LogOptions to container log parameters
-        tail = options.tail if options.tail > 0 else None
+        tail = options.tail if options.tail else -1
         follow = options.follow
 
         # Get logs from the workload
@@ -209,7 +209,11 @@ async def container_log_generator(model_instance_name: str, options: LogOptionsD
                 yield str(log_stream)
 
     except Exception as e:
-        logger.error(f"Failed to get container logs for {model_instance_name}: {e}")
+        cause = getattr(e, "__cause__", None)
+        cause_text = f": {cause}" if cause else ""
+        logger.error(
+            f"Failed to get container logs for {model_instance_name}: {e}{cause_text}"
+        )
 
 
 async def _stream_file_logs_preempt_to_container(
@@ -401,6 +405,9 @@ async def get_serve_logs(
     except (FileNotFoundError, RetryError):
         file_log_exists = False
 
+    if log_options.follow:
+        file_log_exists = True
+
     # show_download_logs parameter is passed from server based on model instance state
     return StreamingResponse(
         combined_log_generator(
@@ -408,6 +415,35 @@ async def get_serve_logs(
             str(download_log_path),
             log_options,
             model_instance_name,
+            file_log_exists,
+        ),
+        media_type="application/octet-stream",
+    )
+
+
+@router.get("/benchmark_logs/{id}")
+async def get_benchmark_logs(
+    request: Request,
+    session: SessionDep,
+    id: int,
+    log_options: LogOptionsDep,
+    benchmark_name: str = Query(default=""),
+):
+    log_dir = request.app.state.config.log_dir
+    main_log_path = Path(log_dir) / "benchmarks" / f"{id}.log"
+
+    try:
+        file.check_file_with_retries(main_log_path)
+        file_log_exists = True
+    except (FileNotFoundError, RetryError):
+        file_log_exists = False
+
+    return StreamingResponse(
+        combined_log_generator(
+            str(main_log_path),
+            "",
+            log_options,
+            benchmark_name,
             file_log_exists,
         ),
         media_type="application/octet-stream",

@@ -2,9 +2,10 @@ from datetime import datetime
 import re
 from enum import Enum
 from sqlalchemy import Enum as SQLEnum, Text
+from sqlalchemy.orm import selectinload
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from typing import List, Optional, TYPE_CHECKING
+from typing import ClassVar, List, Optional, TYPE_CHECKING
 from pydantic import field_validator
 from sqlmodel import (
     Field,
@@ -14,15 +15,17 @@ from sqlmodel import (
     Integer,
     ForeignKey,
 )
+
+from gpustack.schemas.common import ListParams
 from .common import PaginatedList
 from ..mixins import BaseModelMixin
 from .clusters import Cluster
 from .workers import Worker
-from gpustack.schemas.links import ModelUserLink
+from gpustack.schemas.links import UserModelRouteLink
 
 if TYPE_CHECKING:
     from .api_keys import ApiKey
-    from gpustack.schemas.models import Model
+    from gpustack.schemas.model_routes import ModelRoute
 
 
 system_name_prefix = "system/cluster"
@@ -134,23 +137,35 @@ class User(UserBase, BaseModelMixin, table=True):
     hashed_password: str
 
     cluster: Optional[Cluster] = Relationship(
-        back_populates="cluster_users", sa_relationship_kwargs={"lazy": "selectin"}
+        back_populates="cluster_users", sa_relationship_kwargs={"lazy": "noload"}
     )
-    worker: Optional[Worker] = Relationship(sa_relationship_kwargs={"lazy": "selectin"})
+    worker: Optional[Worker] = Relationship(sa_relationship_kwargs={"lazy": "noload"})
 
     api_keys: List["ApiKey"] = Relationship(
         back_populates='user',
-        sa_relationship_kwargs={"cascade": "delete", "lazy": "selectin"},
+        sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
     )
-    models: List["Model"] = Relationship(
+    routes: List["ModelRoute"] = Relationship(
         back_populates="users",
-        link_model=ModelUserLink,
-        sa_relationship_kwargs={"lazy": "selectin"},
+        link_model=UserModelRouteLink,
+        sa_relationship_kwargs={"lazy": "noload"},
     )
 
 
 class UserActivationUpdate(SQLModel):
     is_active: bool
+
+
+class UserListParams(ListParams):
+    sortable_fields: ClassVar[List[str]] = [
+        "username",
+        "is_admin",
+        "full_name",
+        "source",
+        "is_active",
+        "created_at",
+        "updated_at",
+    ]
 
 
 class UserPublic(UserBase):
@@ -172,5 +187,8 @@ def is_default_cluster_user(cluster_user: User) -> bool:
 
 async def get_default_cluster_user(session: AsyncSession) -> Optional[User]:
     return await User.one_by_field(
-        session=session, field="username", value=default_cluster_user_name
+        session=session,
+        field="username",
+        value=default_cluster_user_name,
+        options=[selectinload(User.cluster)],
     )

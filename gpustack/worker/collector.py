@@ -1,6 +1,6 @@
 import socket
 import logging
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable
 from gpustack.config.config import Config
 from gpustack.client.generated_clientset import ClientSet
 from gpustack.detectors.base import GPUDetectExepction
@@ -14,11 +14,10 @@ from gpustack.schemas.workers import (
     WorkerStatusPublic,
     WorkerStatus,
     SystemReserved,
-    GPUDevicesInfo,
+    GPUDevicesStatus,
     SystemInfo,
 )
 from gpustack.utils.profiling import time_decorator
-from gpustack.utils.uuid import get_system_uuid, get_machine_id, get_legacy_uuid
 
 
 logger = logging.getLogger(__name__)
@@ -29,14 +28,12 @@ class WorkerStatusCollector:
     _worker_id_getter: Callable[[], int]
     _worker_ifname_getter: Callable[[], str]
     _worker_ip_getter: Callable[[], str]
-    _system_uuid: str
-    _machine_id: str
-    _system_reserved: SystemReserved
-    _gpu_devices: GPUDevicesInfo
+    _worker_uuid_getter: Callable[[], str]
+    _gpu_devices: GPUDevicesStatus
     _system_info: SystemInfo
 
     @property
-    def gpu_devices(self) -> GPUDevicesInfo:
+    def gpu_devices(self) -> GPUDevicesStatus:
         return self._gpu_devices
 
     @property
@@ -49,28 +46,13 @@ class WorkerStatusCollector:
         worker_ip_getter: Callable[[], str],
         worker_ifname_getter: Callable[[], str],
         worker_id_getter: Callable[[], int],
+        worker_uuid_getter: Callable[[], str],
     ):
         self._cfg = cfg
         self._worker_ip_getter = worker_ip_getter
         self._worker_ifname_getter = worker_ifname_getter
         self._worker_id_getter = worker_id_getter
-        self._system_uuid = get_legacy_uuid(cfg.data_dir) or get_system_uuid(
-            cfg.data_dir
-        )
-        self._machine_id = get_machine_id()
-        reserved_config: Dict[str, int] = {**(cfg.system_reserved or {})}
-        reserved_config["ram"] = reserved_config.get(
-            "ram", reserved_config.pop("memory", 2)
-        )
-        reserved_config["vram"] = reserved_config.get(
-            "vram", reserved_config.pop("gpu_memory", 1)
-        )
-        # GB to Bytes
-        self._system_reserved = SystemReserved(
-            ram=reserved_config["ram"] << 30,
-            vram=reserved_config["vram"] << 30,
-        )
-
+        self._worker_uuid_getter = worker_uuid_getter
         self._gpu_devices = cfg.get_gpu_devices()
         self._system_info = cfg.get_system_info()
         if self._gpu_devices and self._system_info:
@@ -101,7 +83,7 @@ class WorkerStatusCollector:
         self, clientset: ClientSet = None, initial: bool = False
     ) -> WorkerStatusPublic:  # noqa: C901
         """Collect worker status information."""
-        status = WorkerStatus()
+        status = WorkerStatus.get_default_status()
         state_message = None
         try:
             system_info = self._detector_factory.detect_system_info()
@@ -127,16 +109,16 @@ class WorkerStatusCollector:
             metrics_port = -1
 
         return WorkerStatusPublic(
+            advertise_address=self._cfg.advertise_address or self._worker_ip_getter(),
             hostname=socket.gethostname(),
             ip=self._worker_ip_getter(),
             ifname=self._worker_ifname_getter(),
             port=self._cfg.worker_port,
             metrics_port=metrics_port,
-            system_reserved=self._system_reserved,
+            system_reserved=SystemReserved(**self._cfg.get_system_reserved()),
             state_message=state_message,
             status=status,
-            worker_uuid=self._system_uuid,
-            machine_id=self._machine_id,
+            worker_uuid=self._worker_uuid_getter(),
             proxy_mode=self._cfg.proxy_mode,
         )
 

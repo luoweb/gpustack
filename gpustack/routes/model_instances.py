@@ -1,18 +1,23 @@
 from typing import Optional
 import aiohttp
 from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse, RedirectResponse
+from urllib.parse import urlencode
+from sqlalchemy.orm import selectinload
+
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack import envs
-
 from gpustack.server.services import ModelInstanceService
+from gpustack.utils.network import use_proxy_env_for_url
 from gpustack.worker.logs import LogOptionsDep
 from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
 )
 from gpustack.schemas.workers import Worker
-from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
+from gpustack.schemas.clusters import Cluster
+from gpustack.server.db import async_session
+from gpustack.server.deps import ListParamsDep, SessionDep
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceCreate,
@@ -22,14 +27,14 @@ from gpustack.schemas.models import (
     ModelInstanceStateEnum,
 )
 from gpustack.schemas.model_files import ModelFileStateEnum
+from gpustack.config.config import get_global_config
+from gpustack.utils.grafana import resolve_grafana_base_url
 
 router = APIRouter()
 
 
 @router.get("", response_model=ModelInstancesPublic)
 async def get_model_instances(
-    engine: EngineDep,
-    session: SessionDep,
     params: ListParamsDep,
     id: Optional[int] = None,
     model_id: Optional[int] = None,
@@ -51,16 +56,17 @@ async def get_model_instances(
 
     if params.watch:
         return StreamingResponse(
-            ModelInstance.streaming(engine, fields=fields),
+            ModelInstance.streaming(fields=fields),
             media_type="text/event-stream",
         )
 
-    return await ModelInstance.paginated_by_query(
-        session=session,
-        fields=fields,
-        page=params.page,
-        per_page=params.perPage,
-    )
+    async with async_session() as session:
+        return await ModelInstance.paginated_by_query(
+            session=session,
+            fields=fields,
+            page=params.page,
+            per_page=params.perPage,
+        )
 
 
 @router.get("/{id}", response_model=ModelInstancePublic)
@@ -74,8 +80,45 @@ async def get_model_instance(
     return model_instance
 
 
-async def fetch_model_instance(session, id):
+@router.get("/{id}/dashboard")
+async def get_model_instance_dashboard(
+    session: SessionDep,
+    id: int,
+    request: Request,
+):
     model_instance = await ModelInstance.one_by_id(session, id)
+    if not model_instance:
+        raise NotFoundException(message="Model instance not found")
+
+    cfg = get_global_config()
+    if not cfg.get_grafana_url() or not cfg.grafana_model_dashboard_uid:
+        raise InternalServerErrorException(
+            message="Grafana dashboard settings are not configured"
+        )
+
+    cluster = None
+    if model_instance.cluster_id is not None:
+        cluster = await Cluster.one_by_id(session, model_instance.cluster_id)
+
+    query_params = {}
+    if cluster is not None:
+        query_params["var-cluster_name"] = cluster.name
+    query_params["var-model_name"] = model_instance.model_name
+    query_params["var-model_instance_name"] = model_instance.name
+
+    grafana_base = resolve_grafana_base_url(cfg, request)
+    slug = "gpustack-model"
+    dashboard_url = f"{grafana_base}/d/{cfg.grafana_model_dashboard_uid}/{slug}"
+    if query_params:
+        dashboard_url = f"{dashboard_url}?{urlencode(query_params)}"
+
+    return RedirectResponse(url=dashboard_url, status_code=302)
+
+
+async def fetch_model_instance(session, id):
+    model_instance = await ModelInstance.one_by_id(
+        session, id, options=[selectinload(ModelInstance.model_files)]
+    )
     if not model_instance:
         raise NotFoundException(message="Model instance not found")
     if not model_instance.worker_id:
@@ -98,7 +141,7 @@ async def get_serving_logs(  # noqa: C901
     worker = await fetch_worker(session, model_instance.worker_id)
 
     model_instance_log_url = (
-        f"http://{worker.ip}:{worker.port}/serveLogs"
+        f"http://{worker.advertise_address}:{worker.port}/serveLogs"
         f"/{model_instance.id}?{log_options.url_encode()}"
         f"&model_instance_name={model_instance.name}"
     )
@@ -112,7 +155,12 @@ async def get_serving_logs(  # noqa: C901
 
     timeout = aiohttp.ClientTimeout(total=envs.PROXY_TIMEOUT, sock_connect=5)
 
-    client: aiohttp.ClientSession = request.app.state.http_client
+    use_proxy_env = use_proxy_env_for_url(model_instance_log_url)
+    client: aiohttp.ClientSession = (
+        request.app.state.http_client
+        if use_proxy_env
+        else request.app.state.http_client_no_proxy
+    )
 
     if log_options.follow:
 
@@ -168,7 +216,7 @@ async def create_model_instance(
 async def update_model_instance(
     session: SessionDep, id: int, model_instance_in: ModelInstanceUpdate
 ):
-    model_instance = await ModelInstance.one_by_id(session, id)
+    model_instance = await ModelInstance.one_by_id(session, id, for_update=True)
     if not model_instance:
         raise NotFoundException(message="Model instance not found")
 
@@ -183,7 +231,7 @@ async def update_model_instance(
 
 @router.delete("/{id}")
 async def delete_model_instance(session: SessionDep, id: int):
-    model_instance = await ModelInstance.one_by_id(session, id)
+    model_instance = await ModelInstance.one_by_id(session, id, for_update=True)
     if not model_instance:
         raise NotFoundException(message="Model instance not found")
 

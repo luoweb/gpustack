@@ -1,22 +1,24 @@
 import logging
 from typing import List, Optional
 
-from gpustack.policies.base import ModelInstanceScore
+from gpustack.policies.base import ModelInstanceScore, ModelInstanceScorer
 from gpustack.schemas.models import Model, ModelInstance, ModelInstanceStateEnum
 from gpustack.schemas.workers import Worker, WorkerStateEnum
-from gpustack.server.db import get_engine
-from sqlmodel.ext.asyncio.session import AsyncSession
+from gpustack.server.db import async_session
 
 logger = logging.getLogger(__name__)
 
-MaxScore = 100
 
-
-class StatusScorer:
-    def __init__(self, model: Model, model_instance: Optional[ModelInstance] = None):
-        self._engine = get_engine()
+class StatusScorer(ModelInstanceScorer):
+    def __init__(
+        self,
+        model: Model,
+        model_instance: Optional[ModelInstance] = None,
+        max_score: float = 100.0,
+    ):
         self._model = model
         self._model_instance = model_instance
+        self._max_score = max_score
 
     async def score_instances(
         self, instances: List[ModelInstance]
@@ -28,7 +30,7 @@ class StatusScorer:
         logger.debug(f"model {self._model.name}, score instances with status policy")
 
         scored_instances = []
-        async with AsyncSession(self._engine) as session:
+        async with async_session() as session:
             workers = await Worker.all(session)
             worker_map = {worker.id: worker for worker in workers}
 
@@ -41,6 +43,11 @@ class StatusScorer:
 
                 score = 0
                 worker = worker_map.get(instance.worker_id)
+                if worker is None:
+                    scored_instances.append(
+                        ModelInstanceScore(model_instance=instance, score=0)
+                    )
+                    continue
 
                 if worker.state == WorkerStateEnum.NOT_READY:
                     score = 0
@@ -50,9 +57,9 @@ class StatusScorer:
                     worker.state == WorkerStateEnum.READY
                     and instance.state == ModelInstanceStateEnum.RUNNING
                 ):
-                    score = MaxScore
+                    score = self._max_score
                 else:
-                    score = 50
+                    score = self._max_score * 0.5
 
                 scored_instances.append(
                     ModelInstanceScore(model_instance=instance, score=score)

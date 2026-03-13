@@ -8,7 +8,7 @@ GPUStack supports most modern Linux distributions on **AMD64** and **ARM64** arc
 
 !!! note
 
-    - GPUStack is not recommended for direct installation via PyPi. For best compatibility, use the provided Docker images.
+    - GPUStack is not supported for direct installation via PyPi. For best compatibility, use the provided Docker images.
     - The Network Time Protocol (NTP) package must be installed to ensure consistent state synchronization between nodes.
 
 ## Accelerator Runtime Requirements
@@ -23,6 +23,7 @@ GPUStack supports a variety of General-Purpose Accelerators as inference backend
 - [x] Iluvatar GPU (Experimental)
 - [x] MetaX GPU (Experimental)
 - [x] Cambricon MLU (Experimental)
+- [x] T-Head PPU (Experimental)
 
 Ensure all required drivers and toolkits are installed before running GPUStack.
 
@@ -30,7 +31,7 @@ Ensure all required drivers and toolkits are installed before running GPUStack.
 
 #### Requirements
 
-- [NVIDIA GPU Driver](https://www.nvidia.com/en-us/drivers/) that supports NVIDIA CUDA 12.4 or higher.
+- [NVIDIA GPU Driver](https://www.nvidia.com/en-us/drivers/) that supports NVIDIA CUDA 12.6 or higher.
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit)
 
 Run the following commands to verify:
@@ -80,7 +81,7 @@ sudo docker info 2>/dev/null | grep -q "amd" \
 #### Requirements
 
 - [Ascend NPU Driver](https://www.hiascend.com/hardware/firmware-drivers/community)
-- [Ascend Docker Runtime](https://www.hiascend.com/document/detail/zh/mindcluster/72rc1/clustersched/dlug/dlug_installation_017.html)
+- [Ascend Docker Runtime](https://www.hiascend.com/document/detail/zh/mindcluster/730/clustersched/dlug/dlug_installation_017.html)
 
 Run the following commands to verify:
 
@@ -121,7 +122,7 @@ sudo hy-smi
 
 #### Supported Devices
 
-- [x] Hygon DCUs (K100_AI (Verified), Z100/Z100L/K100(Not Verified))
+- [x] Hygon DCUs
 
 #### Supported Inference Backends
 
@@ -207,6 +208,25 @@ sudo cnmon
 
 - [x] Custom
 
+### T-Head PPU
+
+#### Requirements
+
+- T-Head PPU Driver
+- T-Head PPU SDK
+
+Run the following commands to verify:
+
+```bash
+sudo ppu-smi
+```
+
+#### Supported Inference Backends
+
+- [x] [vLLM](https://github.com/vllm-project/vllm)
+- [x] [SGLang](https://github.com/sgl-project/sglang)
+- [x] Custom
+
 ## Networking Requirements
 
 ### Connectivity Requirements
@@ -248,7 +268,7 @@ When using distributed vLLM, GPUStack will parse the above port range for Ray se
 and assign them in order as below:
 
 1. GCS server port (the first port of the range)
-2. Client Server port
+2. Client Server port (reserved for compatibility, not used anymore, see https://github.com/gpustack/gpustack/issues/4171)
 3. Dashboard port
 4. Dashboard gRPC port (no longer used since Ray 2.45.0, kept for backward compatibility)
 5. Dashboard agent gRPC port

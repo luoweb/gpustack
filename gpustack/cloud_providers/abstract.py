@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from abc import ABC, abstractmethod
 from enum import Enum
 from gpustack.schemas.clusters import Volume
@@ -95,11 +95,15 @@ class ProviderClientBase(ABC):
         token: str,
         image_name: str,
         os_image: str,
+        worker_name: str,
+        secret_configs: Dict[str, Any] = {},
     ) -> UserDataTemplate:
         user_data = UserDataTemplate(
             server_url=server_url,
             token=token,
             image_name=image_name,
+            secret_configs=secret_configs,
+            worker_name=worker_name,
         )
         return user_data
 

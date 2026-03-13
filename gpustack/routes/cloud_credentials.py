@@ -1,6 +1,6 @@
 from urllib.parse import urljoin
 from functools import partial
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from gpustack.api.exceptions import (
@@ -8,9 +8,11 @@ from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
 )
-from gpustack.server.deps import ListParamsDep, SessionDep, EngineDep
+from gpustack.server.db import async_session
+from gpustack.server.deps import SessionDep
 from gpustack.schemas.clusters import (
     CloudCredentialCreate,
+    CloudCredentialListParams,
     CloudCredentialPublic,
     CloudCredentialsPublic,
     CloudCredentialUpdate,
@@ -25,9 +27,7 @@ router = APIRouter()
 
 @router.get("", response_model=CloudCredentialsPublic)
 async def list(
-    engine: EngineDep,
-    session: SessionDep,
-    params: ListParamsDep,
+    params: CloudCredentialListParams = Depends(),
     name: str = None,
     search: str = None,
 ):
@@ -41,17 +41,19 @@ async def list(
 
     if params.watch:
         return StreamingResponse(
-            CloudCredential.streaming(engine, fields=fields, fuzzy_fields=fuzzy_fields),
+            CloudCredential.streaming(fields=fields, fuzzy_fields=fuzzy_fields),
             media_type="text/event-stream",
         )
 
-    return await CloudCredential.paginated_by_query(
-        session=session,
-        fields=fields,
-        fuzzy_fields=fuzzy_fields,
-        page=params.page,
-        per_page=params.perPage,
-    )
+    async with async_session() as session:
+        return await CloudCredential.paginated_by_query(
+            session=session,
+            fields=fields,
+            fuzzy_fields=fuzzy_fields,
+            page=params.page,
+            per_page=params.perPage,
+            order_by=params.order_by,
+        )
 
 
 @router.get("/{id}", response_model=CloudCredentialPublic)

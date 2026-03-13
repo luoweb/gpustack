@@ -1,23 +1,28 @@
 import asyncio
 import logging
 import os
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+from sqlmodel.ext.asyncio.session import AsyncSession
+from gpustack.client.worker_filesystem_client import WorkerFilesystemClient
 from gpustack.policies.base import (
     Allocatable,
     Allocated,
 )
+from gpustack.scheduler.calculator import calculate_local_model_weight_size
 from gpustack.schemas.models import (
     ModelInstance,
     Model,
     CategoryEnum,
     SourceEnum,
+    is_llm_model,
 )
-from gpustack.schemas.workers import Worker, GPUDevicesInfo, GPUDeviceInfo
-from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlalchemy.ext.asyncio import AsyncEngine
+from gpustack.schemas.model_files import ModelFileStateEnum
+from gpustack.schemas.workers import Worker, GPUDevicesStatus, GPUDeviceStatus
 from pydantic import BaseModel
 
-from gpustack.utils.hub import get_model_weight_size
+from gpustack.server.services import ModelFileService
+from gpustack.utils.hub import get_model_weight_size, get_diffusion_model_weight_size
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +34,17 @@ class WorkerGPUInfo(BaseModel):
 
     worker_id: int
     worker_name: str
-    gpu_device: GPUDeviceInfo
+    gpu_device: GPUDeviceStatus
     allocatable_vram: int  # in bytes
 
 
-async def get_worker_allocatable_resource(  # noqa: C901
-    engine: AsyncEngine,
+def get_worker_allocatable_resource(  # noqa: C901
+    all_model_instances: List[ModelInstance],
     worker: Worker,
+    gpu_type: Optional[str] = None,
 ) -> Allocatable:
     """
-    Get the worker with the latest allocatable resources.
+    Get the worker with the latest allocatable resources, if gpu_type is provided, only consider the GPUs of that type.
     """
 
     def update_allocated_vram(allocated, resource_claim):
@@ -46,12 +52,16 @@ async def get_worker_allocatable_resource(  # noqa: C901
             allocated.vram[gpu_index] = allocated.vram.get(gpu_index, 0) + vram
 
     is_unified_memory = worker.status.memory.is_unified_memory
-    model_instances = await get_worker_model_instances(engine, worker)
+    model_instances = get_worker_model_instances(all_model_instances, worker)
     allocated = Allocated(ram=0, vram={})
 
     for model_instance in model_instances:
         # Handle resource allocation for main worker
-        if model_instance.worker_id == worker.id:
+        if model_instance.worker_id == worker.id and (
+            gpu_type is None
+            or model_instance.gpu_type is None
+            or model_instance.gpu_type == gpu_type
+        ):
             allocated.ram += model_instance.computed_resource_claim.ram or 0
             if model_instance.gpu_indexes:
                 update_allocated_vram(allocated, model_instance.computed_resource_claim)
@@ -67,7 +77,9 @@ async def get_worker_allocatable_resource(  # noqa: C901
                 if subordinate_worker.worker_id != worker.id:
                     continue
 
-                if subordinate_worker.computed_resource_claim:
+                if subordinate_worker.computed_resource_claim and (
+                    gpu_type is None or model_instance.gpu_type == gpu_type
+                ):
                     # rpc server only consider the vram
                     update_allocated_vram(
                         allocated, subordinate_worker.computed_resource_claim
@@ -78,7 +90,11 @@ async def get_worker_allocatable_resource(  # noqa: C901
         for _, gpu in enumerate(worker.status.gpu_devices):
             gpu_index = gpu.index
 
-            if gpu.memory is None or gpu.memory.total is None:
+            if (
+                gpu.memory is None
+                or gpu.memory.total is None
+                or (gpu_type is not None and gpu.type != gpu_type)
+            ):
                 continue
             allocatable_vram = max(
                 (
@@ -108,7 +124,8 @@ async def get_worker_allocatable_resource(  # noqa: C901
             allocatable.vram[0] = min(allocatable.ram, allocatable.vram[0])
 
     logger.debug(
-        f"Worker {worker.name} reserved memory: {worker.system_reserved.ram}, "
+        f"Worker {worker.name} gpu_type {gpu_type}, "
+        f"reserved memory: {worker.system_reserved.ram}, "
         f"reserved gpu memory: {worker.system_reserved.vram}, "
         f"allocatable memory: {allocatable.ram}, "
         f"allocatable gpu memory: {allocatable.vram}"
@@ -116,7 +133,9 @@ async def get_worker_allocatable_resource(  # noqa: C901
     return allocatable
 
 
-def group_gpu_devices_by_memory(gpu_devices: GPUDevicesInfo) -> List[GPUDevicesInfo]:
+def group_gpu_devices_by_memory(
+    gpu_devices: GPUDevicesStatus,
+) -> List[GPUDevicesStatus]:
     """
     Group GPU devices by allocatable memory size with the constraint that the minimum
     allocatable GPU memory in each group should not be less than 0.9 times the
@@ -138,7 +157,7 @@ def group_gpu_devices_by_memory(gpu_devices: GPUDevicesInfo) -> List[GPUDevicesI
     if not gpu_devices:
         return []
 
-    def get_allocatable_memory(gpu: GPUDeviceInfo) -> Optional[int]:
+    def get_allocatable_memory(gpu: GPUDeviceStatus) -> Optional[int]:
         """Calculate allocatable memory (total - allocated)"""
         if not gpu.memory or gpu.memory.total is None:
             return None
@@ -188,15 +207,97 @@ def group_gpu_devices_by_memory(gpu_devices: GPUDevicesInfo) -> List[GPUDevicesI
     return groups
 
 
-async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
+def group_workers_by_gpu_type(workers: List[Worker]) -> Dict[str, List[Worker]]:
+    """
+    Group workers by their GPU types.
+
+    Args:
+        workers: List of workers containing GPU devices
+
+    Returns:
+        Dictionary mapping GPU type to list of workers that with gpus of that type
+    """
+    gpu_type_to_workers: Dict[str, List[Worker]] = {}
+
+    for worker in workers:
+        if not worker.status or not worker.status.gpu_devices:
+            gpu_type_to_workers.setdefault(None, []).append(worker)
+            continue
+
+        # Collect unique GPU types for this worker
+        gpus: Dict[str, GPUDevicesStatus] = {}
+        for gpu in worker.status.gpu_devices:
+            gpus.setdefault(gpu.type, []).append(gpu)
+
+        # Add worker to each GPU type group
+        for gpu_type in gpus.keys():
+            w = worker.model_copy()
+            w.status.gpu_devices = gpus[gpu_type]
+            gpu_type_to_workers.setdefault(gpu_type, []).append(w)
+
+    return gpu_type_to_workers
+
+
+def get_vram_claim_from_model_env(model: Model) -> Optional[int]:
+    """
+    Get the VRAM claim from model environment variable 'GPUSTACK_MODEL_VRAM_CLAIM' if set.
+    """
+    if model.env and 'GPUSTACK_MODEL_VRAM_CLAIM' in model.env:
+        try:
+            return int(model.env['GPUSTACK_MODEL_VRAM_CLAIM'])
+        except ValueError:
+            logger.warning(
+                f"Invalid VRAM claim value for model {model.name}: {model.env['GPUSTACK_MODEL_VRAM_CLAIM']}"
+            )
+
+    return None
+
+
+async def _get_cached_model_size(
+    session: Optional[AsyncSession],
+    model: Model,
+) -> Optional[int]:
+    """
+    Get cached file size from downloaded ModelFile.
+    """
+    if not session:
+        return None
+
+    source_index = model.model_source_index
+    if not source_index:
+        return None
+
+    model_files = await ModelFileService(session).get_by_source_index(source_index)
+    if not model_files:
+        return None
+
+    # Find READY files with size
+    for mf in model_files:
+        if mf.state == ModelFileStateEnum.READY and mf.size:
+            logger.info(f"Using cached size {mf.size} from ModelFile {mf.id}")
+            return mf.size
+
+    return None
+
+
+async def estimate_model_vram(
+    model: Model,
+    token: Optional[str] = None,
+    workers: Optional[List[Worker]] = None,
+    session: Optional[AsyncSession] = None,
+) -> int:
     """
     Estimate the vram requirement in bytes heuristically.
     This is the minimum requirement to help us decide how many GPUs are needed for the model.
     If users explicitly set parameters like tp & pp, this estimation is not needed.
 
-    Formula:
+    Formula for Diffusion (Image) models:
 
-        VRAM = WEIGHT * 1.2 + RESERVERD_FOOTPRINT
+        VRAM = WEIGHT_SIZE
+
+    Formula for LLM models:
+
+        VRAM = WEIGHT_SIZE * 1.2 + RESERVED_FOOTPRINT
 
     Reference for the 20% overhead: https://blog.eleuther.ai/transformer-math/#total-inference-memory
 
@@ -207,23 +308,22 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
     - 72B requires 164.5 GiB
 
     """
-    if model.env and 'GPUSTACK_MODEL_VRAM_CLAIM' in model.env:
+    env_vram_claim = get_vram_claim_from_model_env(model)
+    if env_vram_claim is not None:
         # Use as a potential workaround if the empirical vram estimation is far beyond the expected value.
-        return int(model.env['GPUSTACK_MODEL_VRAM_CLAIM'])
+        return env_vram_claim
 
-    # CUDA graphs can take additional 1~3 GiB memory
-    # https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/worker/model_runner.py#L1313
-    # For non-LLM models like embedding, set a smaller overhead
-    framework_overhead = (
-        2 * 1024**3
-        if not model.categories or CategoryEnum.LLM in model.categories
-        else 512 * 1024**2
-    )
     weight_size = 0
     timeout_in_seconds = 15
 
     try:
-        if (
+        if model.categories and CategoryEnum.IMAGE in model.categories:
+            weight_size = await asyncio.wait_for(
+                estimate_diffusion_model_vram(model, token, workers, session),
+                timeout=timeout_in_seconds,
+            )
+            return weight_size
+        elif (
             model.source == SourceEnum.HUGGING_FACE
             or model.source == SourceEnum.MODEL_SCOPE
         ):
@@ -231,50 +331,103 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
                 asyncio.to_thread(get_model_weight_size, model, token),
                 timeout=timeout_in_seconds,
             )
-        elif model.source == SourceEnum.LOCAL_PATH and os.path.exists(model.local_path):
-            weight_size = get_local_model_weight_size(model.local_path)
+        elif model.source == SourceEnum.LOCAL_PATH:
+            # Try to get cached size from ModelFile first
+            cached_size = await _get_cached_model_size(session, model)
+            if cached_size:
+                weight_size = cached_size
+            else:
+                # Fall back to querying workers
+                weight_size = await get_local_model_weight_size(
+                    model.local_path, workers, is_diffusion=False
+                )
     except asyncio.TimeoutError:
         logger.warning(f"Timeout when getting weight size for model {model.name}")
     except Exception as e:
         logger.warning(f"Cannot get weight size for model {model.name}: {e}")
 
     # Reference: https://blog.eleuther.ai/transformer-math/#total-inference-memory
-    return weight_size * 1.2 + framework_overhead
+    activation_overhead_factor = 1.2
+    if model.categories and CategoryEnum.TEXT_TO_SPEECH in model.categories:
+        # Emperical factor base on Qwen3-TTS
+        activation_overhead_factor = 3
+
+    # CUDA graphs can take additional 1~3 GiB memory
+    # https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/worker/model_runner.py#L1313
+    # For non-LLM models like embedding, set a smaller overhead
+    framework_overhead = 2 * 1024**3 if is_llm_model(model) else 512 * 1024**2
+
+    return int(weight_size * activation_overhead_factor) + framework_overhead
 
 
-async def get_worker_model_instances(
-    engine: AsyncEngine, worker: Worker
+async def estimate_diffusion_model_vram(
+    model: Model,
+    token: Optional[str] = None,
+    workers: Optional[List[Worker]] = None,
+    session: Optional[AsyncSession] = None,
+) -> int:
+    """ """
+    if model.env and 'GPUSTACK_MODEL_VRAM_CLAIM' in model.env:
+        # Use as a potential workaround if the empirical vram estimation is far beyond the expected value.
+        return int(model.env['GPUSTACK_MODEL_VRAM_CLAIM'])
+    weight_size = 0
+    timeout_in_seconds = 15
+    try:
+        if (
+            model.source == SourceEnum.HUGGING_FACE
+            or model.source == SourceEnum.MODEL_SCOPE
+        ):
+            weight_size = await asyncio.wait_for(
+                asyncio.to_thread(get_diffusion_model_weight_size, model, token),
+                timeout=timeout_in_seconds,
+            )
+        elif model.source == SourceEnum.LOCAL_PATH:
+            # Try to get cached size from ModelFile first
+            cached_size = await _get_cached_model_size(session, model)
+            if cached_size:
+                weight_size = cached_size
+            else:
+                # Fall back to querying workers with is_diffusion=True
+                weight_size = await get_local_model_weight_size(
+                    model.local_path, workers, is_diffusion=True
+                )
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout when getting weight size for model {model.name}")
+    except Exception as e:
+        logger.warning(f"Cannot get weight size for model {model.name}: {e}")
+
+    return weight_size
+
+
+def get_worker_model_instances(
+    all_model_instances: List[ModelInstance], worker: Worker
 ) -> List[ModelInstance]:
     """
     Get all model instances related to the worker, including:
     1. Model instances assigned to this worker (main worker)
     2. Model instances that use this worker as a subordinate worker in distributed inference
     """
-    async with AsyncSession(engine) as session:
-        # Get all model instances from the database
-        all_model_instances = await ModelInstance.all(session)
+    # Filter to get only the relevant instances:
+    # 1. Instances assigned to this worker (main worker)
+    # 2. Instances that use this worker as a subordinate worker
+    relevant_instances = []
+    for model_instance in all_model_instances:
+        # Check if this is a main worker instance
+        if model_instance.worker_id == worker.id:
+            relevant_instances.append(model_instance)
+        # Check if this worker is used as a subordinate worker
+        elif (
+            model_instance.distributed_servers
+            and model_instance.distributed_servers.subordinate_workers
+        ):
+            for (
+                subordinate_worker
+            ) in model_instance.distributed_servers.subordinate_workers:
+                if subordinate_worker.worker_id == worker.id:
+                    relevant_instances.append(model_instance)
+                    break
 
-        # Filter to get only the relevant instances:
-        # 1. Instances assigned to this worker (main worker)
-        # 2. Instances that use this worker as a subordinate worker
-        relevant_instances = []
-        for model_instance in all_model_instances:
-            # Check if this is a main worker instance
-            if model_instance.worker_id == worker.id:
-                relevant_instances.append(model_instance)
-            # Check if this worker is used as a subordinate worker
-            elif (
-                model_instance.distributed_servers
-                and model_instance.distributed_servers.subordinate_workers
-            ):
-                for (
-                    subordinate_worker
-                ) in model_instance.distributed_servers.subordinate_workers:
-                    if subordinate_worker.worker_id == worker.id:
-                        relevant_instances.append(model_instance)
-                        break
-
-        return relevant_instances
+    return relevant_instances
 
 
 class ListMessageBuilder:
@@ -334,31 +487,114 @@ def get_model_num_attention_heads(pretrained_config) -> Optional[int]:
     return num_attention_heads
 
 
-def get_local_model_weight_size(local_path: str) -> int:
-    """
-    Get the local model weight size in bytes. Estimate by the total size of files in the top-level (depth 1) of the directory.
-    """
-    total_size = 0
+def _get_config_value(config: Any, key: str) -> Any:
+    if config is None:
+        return None
+    if isinstance(config, dict):
+        return config.get(key)
+    return getattr(config, key, None)
 
+
+def _get_config_int(config: Any, key: str) -> Optional[int]:
+    value = _get_config_value(config, key)
+    if type(value) is int:
+        return value
+    return None
+
+
+def get_model_vision_num_attention_heads(pretrained_config: Any) -> Optional[int]:
+    """
+    Get total vision attention heads used for TP divisibility check.
+
+    Priority for raw heads: num_attention_heads > num_heads.
+    The final value is:
+        total_vision_heads = raw_heads + max(num_dummy_heads, 0)
+    """
     try:
-        with os.scandir(local_path) as entries:
-            for entry in entries:
-                if entry.is_file():
-                    total_size += entry.stat().st_size
-    except FileNotFoundError:
+        vision_config = _get_config_value(pretrained_config, "vision_config")
+        if not vision_config:
+            return None
+
+        num_heads = _get_config_int(vision_config, "num_attention_heads")
+        if num_heads is None:
+            num_heads = _get_config_int(vision_config, "num_heads")
+        if num_heads is None or num_heads <= 0:
+            return None
+
+        num_dummy_heads = _get_config_int(vision_config, "num_dummy_heads") or 0
+        return num_heads + max(num_dummy_heads, 0)
+    except Exception as e:
+        logger.warning(f"Cannot get vision num_attention_heads: {e}")
+        return None
+
+
+async def get_local_model_weight_size(
+    local_path: str,
+    workers: Optional[List[Worker]] = None,
+    is_diffusion: bool = False,
+) -> int:
+    """
+    Get the local model weight size in bytes.
+
+    If the model exists locally (on the server), calculate it locally.
+    Otherwise, if workers are provided, check if the model exists on any worker and get the size from there.
+
+    Args:
+        local_path: Path to the model directory
+        workers: Optional list of workers to check
+        is_diffusion: Whether this is a diffusion model (default: False)
+
+    Returns:
+        Total size in bytes
+    """
+    if os.path.exists(local_path):
+        if not os.path.isdir(local_path):
+            raise NotADirectoryError(
+                f"The specified path '{local_path}' is not a directory."
+            )
+        try:
+            # Use utility function to calculate size
+            return calculate_local_model_weight_size(local_path, is_diffusion)
+        except Exception as e:
+            logger.error(f"Failed to calculate size locally for {local_path}: {e}")
+            raise e
+
+    if not workers:
         raise FileNotFoundError(f"The specified path '{local_path}' does not exist.")
-    except NotADirectoryError:
-        raise NotADirectoryError(
-            f"The specified path '{local_path}' is not a directory."
-        )
-    except PermissionError:
-        raise PermissionError(f"Permission denied when accessing '{local_path}'.")
 
-    return total_size
+    async def try_get_size_from_worker(worker: Worker) -> Optional[int]:
+        """Try to get model weight size from a single worker."""
+        try:
+            async with WorkerFilesystemClient() as fs_client:
+                size = await fs_client.get_model_weight_size(worker, local_path)
+                if isinstance(size, int):
+                    logger.info(
+                        f"Successfully got model weight size from worker {worker.id}: {size} bytes"
+                    )
+                    return size
+                return None
+        except Exception as e:
+            logger.debug(
+                f"Failed to get model weight size from worker {worker.id}: {e}"
+            )
+            return None
+
+    # Concurrently try all workers and return the first successful result
+    logger.info(f"Broadcasting model weight size request to {len(workers)} workers")
+    tasks = [try_get_size_from_worker(worker) for worker in workers]
+
+    # Use as_completed to get results as they finish
+    for completed_task in asyncio.as_completed(tasks):
+        result = await completed_task
+        if result is not None:
+            return result
 
 
-async def group_worker_gpu_by_memory(
-    engine: AsyncEngine, workers: List[Worker], ram_claim: int = 0
+def group_worker_gpu_by_memory(
+    workers: List[Worker],
+    model_instances: List[ModelInstance],
+    ram_claim: int = 0,
+    gpu_type: Optional[str] = None,
 ) -> List[List[WorkerGPUInfo]]:
     """
     Group GPU devices from multiple workers by allocatable memory size with the constraint
@@ -392,7 +628,7 @@ async def group_worker_gpu_by_memory(
             continue
 
         # Get allocatable resources for this worker
-        allocatable = await get_worker_allocatable_resource(engine, worker)
+        allocatable = get_worker_allocatable_resource(model_instances, worker, gpu_type)
 
         if ram_not_enough(ram_claim, allocatable):
             continue
@@ -526,7 +762,7 @@ def sort_workers_by_gpu_count(workers: List[Worker]):
 
 
 def sort_gpu_indexes_by_allocatable_rate(
-    worker: Worker, allocatable: dict
+    worker: Worker, allocatable: dict, gpu_type: Optional[str] = None
 ) -> List[int]:
     """
     Sort GPU indexes of a worker by allocatable VRAM rate (allocatable_vram / total_vram), ascending.
@@ -534,7 +770,9 @@ def sort_gpu_indexes_by_allocatable_rate(
     allocatable_rate = {
         gpu.index: (
             allocatable.get(gpu.index, 0) / gpu.memory.total
-            if gpu.memory and gpu.memory.total
+            if gpu.memory
+            and gpu.memory.total
+            and (gpu_type is None or gpu.type == gpu_type)
             else 0
         )
         for gpu in worker.status.gpu_devices
@@ -544,11 +782,11 @@ def sort_gpu_indexes_by_allocatable_rate(
     return sorted(allocatable_rate, key=lambda idx: allocatable_rate[idx], reverse=True)
 
 
-async def sort_selected_workers_by_resource(
+def sort_selected_workers_by_gpu_type_and_resource(
     workers: List[Worker],
-    selected_gpu_indexes_by_worker: Dict[str, List[int]],
-    get_worker_allocatable_resource: Callable[[Worker], Awaitable[Allocatable]],
-) -> List[Worker]:
+    selected_gpu_indexes_by_gpu_type_and_worker: Dict[str, Dict[str, List[int]]],
+    get_worker_allocatable_resource: Callable[[Worker, Optional[str]], Allocatable],
+) -> Dict[str, List[Worker]]:
     """
     Filter and sort selected workers by their GPU resource availability.
 
@@ -556,36 +794,45 @@ async def sort_selected_workers_by_resource(
     then sorts their GPU devices by allocatable VRAM rate (ascending),
     and finally sorts the workers by the number of GPUs (descending).
     """
-    selected_workers = []
-    for worker in workers:
-        # Skip invalid
-        selected_gpu_indexes = selected_gpu_indexes_by_worker.get(worker.name)
-        if (
-            not worker.status
-            or not worker.status.gpu_devices
-            or not selected_gpu_indexes
-        ):
-            continue
+    selected_workers_by_gpu_type = {
+        gpu_type: [] for gpu_type in selected_gpu_indexes_by_gpu_type_and_worker.keys()
+    }
+    selected_gpu_types = list(selected_gpu_indexes_by_gpu_type_and_worker.keys())
+    for gpu_type in selected_gpu_types:
+        for worker in workers:
+            # Skip invalid
+            selected_gpu_indexes = selected_gpu_indexes_by_gpu_type_and_worker.get(
+                gpu_type, {}
+            ).get(worker.name)
+            if (
+                not worker.status
+                or not worker.status.gpu_devices
+                or not selected_gpu_indexes
+            ):
+                continue
 
-        # Sort selected GPUs by allocatable rate
-        allocatable = await get_worker_allocatable_resource(worker)
-        sorted_gpu_indexes = [
-            idx
-            for idx in sort_gpu_indexes_by_allocatable_rate(worker, allocatable.vram)
-            if idx in selected_gpu_indexes
-        ]
-        sorted_gpus = [
-            gpu
-            for idx in sorted_gpu_indexes
-            for gpu in worker.status.gpu_devices
-            if gpu.index == idx
-        ]
+            # Sort selected GPUs by allocatable rate
+            allocatable = get_worker_allocatable_resource(worker, gpu_type)
+            sorted_gpu_indexes = [
+                idx
+                for idx in sort_gpu_indexes_by_allocatable_rate(
+                    worker, allocatable.vram
+                )
+                if idx in selected_gpu_indexes
+            ]
+            sorted_gpus = [
+                gpu
+                for idx in sorted_gpu_indexes
+                for gpu in worker.status.gpu_devices
+                if gpu.index == idx and (gpu_type is None or gpu.type == gpu_type)
+            ]
 
-        # Create a copy of the worker with sorted GPUs
-        w = worker.model_copy(deep=True)
-        w.status.gpu_devices = sorted_gpus
-        selected_workers.append(w)
+            # Create a copy of the worker with sorted GPUs
+            w = worker.model_copy(deep=True)
+            w.status.gpu_devices = sorted_gpus
+            selected_workers_by_gpu_type[gpu_type].append(w)
 
     # Sort workers by GPU count
-    sort_workers_by_gpu_count(selected_workers)
-    return selected_workers
+    for gpu_type in selected_workers_by_gpu_type:
+        sort_workers_by_gpu_count(selected_workers_by_gpu_type[gpu_type])
+    return selected_workers_by_gpu_type

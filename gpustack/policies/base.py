@@ -23,6 +23,7 @@ class ModelInstanceScheduleCandidate:
     worker: Worker
     gpu_indexes: Optional[List[int]]
     computed_resource_claim: ComputedResourceClaim
+    gpu_type: Optional[str] = None
     gpu_addresses: Optional[List[str]] = None
     score: Optional[float] = None
     overcommit: Optional[bool] = None
@@ -115,6 +116,10 @@ class WorkerFilterChain:
 
 
 class ModelInstanceScorer(ABC):
+    @property
+    def max_score(self) -> Optional[float]:
+        return getattr(self, "_max_score", None)
+
     @abstractmethod
     async def score_instances(
         self, instances: List[ModelInstance]

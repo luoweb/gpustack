@@ -1,12 +1,16 @@
 import uuid
 from datetime import datetime, timezone
 import logging
+import aiohttp
+from aiocache import cached
 from fastapi import Depends, Request
-from gpustack.config.config import Config, GatewayModeEnum
+from gpustack.config.config import Config
+from gpustack.schemas.config import GatewayModeEnum
 from gpustack.server.db import get_session
 from typing import Annotated, Optional, Tuple
 from fastapi.security import (
     APIKeyCookie,
+    APIKeyHeader,
     HTTPAuthorizationCredentials,
     HTTPBasic,
     HTTPBasicCredentials,
@@ -31,15 +35,24 @@ logger = logging.getLogger(__name__)
 
 SESSION_COOKIE_NAME = "gpustack_session"
 OIDC_ID_TOKEN_COOKIE_NAME = "gpustack_oidc_id_token"
+SSO_LOGIN_COOKIE_NAME = "gpustack_sso_login"
 SYSTEM_USER_PREFIX = "system/"
 SYSTEM_WORKER_USER_PREFIX = "system/worker/"
 basic_auth = HTTPBasic(auto_error=False)
 bearer_auth = HTTPBearer(auto_error=False)
+api_key_header_auth = APIKeyHeader(name="X-API-Key", auto_error=False)
 cookie_auth = APIKeyCookie(name=SESSION_COOKIE_NAME, auto_error=False)
 
 credentials_exception = UnauthorizedException(
     message="Invalid authentication credentials"
 )
+
+
+def client_ip_getter(request: Request) -> str:
+    if request.app.state.server_config.gateway_mode == GatewayModeEnum.embedded:
+        return request.headers.get("X-GPUStack-Real-IP", "")
+    else:
+        return request.client.host
 
 
 async def get_current_user(
@@ -51,6 +64,7 @@ async def get_current_user(
     bearer_token: Annotated[
         Optional[HTTPAuthorizationCredentials], Depends(bearer_auth)
     ] = None,
+    x_api_key: Annotated[Optional[str], Depends(api_key_header_auth)] = None,
     cookie_token: Annotated[Optional[str], Depends(cookie_auth)] = None,
 ) -> User:
     if hasattr(request.state, "user"):
@@ -58,42 +72,35 @@ async def get_current_user(
         return user
     api_key: Optional[ApiKey] = None
     user = None
-    if basic_credentials and is_system_user(basic_credentials.username):
+    try:
         server_config: Config = request.app.state.server_config
-        user = await authenticate_system_user(server_config, basic_credentials)
-    elif basic_credentials:
-        user = await authenticate_basic_user(session, basic_credentials)
-    elif cookie_token:
-        jwt_manager: JWTManager = request.app.state.jwt_manager
-        user = await get_user_from_jwt_token(session, jwt_manager, cookie_token)
-    elif bearer_token:
-        user, api_key = await get_user_from_bearer_token(session, bearer_token)
+        if basic_credentials and is_system_user(basic_credentials.username):
+            user = await authenticate_system_user(server_config, basic_credentials)
+        elif basic_credentials:
+            user = await authenticate_basic_user(session, basic_credentials)
+        elif cookie_token:
+            jwt_manager: JWTManager = request.app.state.jwt_manager
+            user = await get_user_from_jwt_token(session, jwt_manager, cookie_token)
+        elif bearer_token or x_api_key:
+            token = (bearer_token.credentials if bearer_token else None) or x_api_key
+            if token is not None:
+                user, api_key = await get_user_from_api_token(session, token)
 
-    server_config: Config = request.app.state.server_config
-
-    def client_ip_getter() -> str:
-        if server_config.gateway_mode != GatewayModeEnum.disabled:
-            return request.headers.get("X-GPUStack-Real-IP", "")
-        else:
-            return request.client.host
-
-    if user is None and client_ip_getter() == "127.0.0.1":
-        if not server_config.force_auth_localhost:
-            try:
+        if user is None and client_ip_getter(request=request) == "127.0.0.1":
+            if not server_config.force_auth_localhost:
                 user = await User.first_by_field(session, "is_admin", True)
-            except Exception as e:
-                raise InternalServerErrorException(message=f"Failed to get user: {e}")
-    if user:
-        if not user.is_active:
-            raise UnauthorizedException(message="User account is deactivated")
-        request.state.user = user
-        access_key = None if api_key is None else api_key.access_key
-        if api_key is not None:
-            request.state.api_key = api_key
-        request.state.user_allow_model_names = await UserService(
-            session
-        ).get_user_accessible_model_names(user.id, access_key)
-        return user
+        if user:
+            if not user.is_active:
+                raise UnauthorizedException(message="User account is deactivated")
+            request.state.user = user
+            if api_key is not None:
+                request.state.api_key = api_key
+            return user
+
+    except UnauthorizedException:
+        raise
+    except Exception as e:
+        raise InternalServerErrorException(message=f"Failed to authenticate user: {e}")
 
     raise credentials_exception
 
@@ -201,11 +208,13 @@ def parse_uuid(value: str) -> Optional[str]:
         return None
 
 
-async def get_user_from_bearer_token(
-    session: AsyncSession, bearer_token: HTTPAuthorizationCredentials
+async def get_user_from_api_token(
+    session: AsyncSession, token: str
 ) -> Tuple[Optional[User], Optional[ApiKey]]:
     try:
-        parts = bearer_token.credentials.split("_")
+        access_key = ""
+        secret_key = token
+        parts = token.split("_", maxsplit=2)
         if len(parts) == 3 and parts[0] == API_KEY_PREFIX:
             access_key = parts[1]
             secret_key = parts[2]
@@ -214,20 +223,20 @@ async def get_user_from_bearer_token(
             if worker_uuid is not None:
                 access_key = ""
 
-            api_key = await APIKeyService(session).get_by_access_key(access_key)
-            if (
-                api_key is not None
-                and verify_hashed_secret(api_key.hashed_secret_key, secret_key)
-                and (
-                    api_key.expires_at is None
-                    or api_key.expires_at > datetime.now(timezone.utc)
-                )
-            ):
-                user: Optional[User] = await UserService(session).get_by_id(
-                    user_id=api_key.user_id,
-                )
-                if user is not None:
-                    return user, api_key
+        api_key = await APIKeyService(session).get_by_access_key(access_key)
+        if (
+            api_key is not None
+            and verify_hashed_secret(api_key.hashed_secret_key, secret_key)
+            and (
+                api_key.expires_at is None
+                or api_key.expires_at > datetime.now(timezone.utc)
+            )
+        ):
+            user: Optional[User] = await UserService(session).get_by_id(
+                user_id=api_key.user_id,
+            )
+            if user is not None:
+                return user, api_key
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to get user: {e}")
 
@@ -255,10 +264,43 @@ async def worker_auth(
     bearer_token: Annotated[
         Optional[HTTPAuthorizationCredentials], Depends(bearer_auth)
     ] = None,
+    x_api_key: Annotated[Optional[str], Depends(api_key_header_auth)] = None,
 ):
-    if not bearer_token:
+    token_value = (bearer_token.credentials if bearer_token else None) or x_api_key
+    if not token_value:
         raise UnauthorizedException(message="Invalid authentication credentials")
     token = request.app.state.token
-    registration_token = request.app.state.config.token
-    if bearer_token.credentials not in [token, registration_token]:
-        raise UnauthorizedException(message="Invalid authentication credentials")
+    config: Config = request.app.state.config
+    registration_token = config.token
+    server_url = config.get_server_url()
+    if token_value in [token, registration_token]:
+        return
+    model_name = request.headers.get("X-Higress-Llm-Model")
+    if model_name is not None:
+        cred = token_value
+        show_len = max(1, min(6, len(cred)))
+        masked_token = f"{'*' * (len(cred) - show_len)}{cred[-show_len:]}"
+        logger.debug(f"Verifying worker token {masked_token} via server authentication")
+        cached_auth = make_auth_token_via_server(request.app.state.http_client_no_proxy)
+        is_valid = await cached_auth(server_url, token_value, model_name)
+        if is_valid:
+            return
+    raise UnauthorizedException(message="Invalid authentication credentials")
+
+
+def make_auth_token_via_server(client: aiohttp.ClientSession):
+    @cached(ttl=60)
+    async def inner(server_url: str, token: str, model_name: str) -> bool:
+        auth_url = f"{server_url.rstrip('/')}/token-auth"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Higress-Llm-Model": model_name,
+        }
+        try:
+            async with client.get(auth_url, headers=headers) as resp:
+                return resp.status == 200
+        except aiohttp.ClientError as e:
+            logger.error(f"Error verifying token via server: {e}")
+            return False
+
+    return inner
