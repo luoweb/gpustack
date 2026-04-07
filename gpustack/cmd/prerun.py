@@ -19,7 +19,6 @@ from gpustack.utils.s6_services import (
     postgres_services,
     migration_services,
     observability_services,
-    all_dependent_services,
     all_services,
     gpustack_service_name,
 )
@@ -395,14 +394,10 @@ def prepare_s6_overlay(
     if s6_base_path is None:
         s6_base_path = "/etc/s6-overlay/s6-rc.d"
 
-    # ensure dirs exist
-    gpustack_dependencies_path = os.path.join(s6_base_path, "gpustack/dependencies.d")
-    os.makedirs(gpustack_dependencies_path, exist_ok=True)
-    cleanup_s6_services(gpustack_dependencies_path, *all_dependent_services())
-
     s6_overlay_path = os.path.join(s6_base_path, "user/contents.d")
     os.makedirs(s6_overlay_path, exist_ok=True)
     cleanup_s6_services(s6_overlay_path, *all_services())
 
-    create_s6_services(gpustack_dependencies_path, *dependency_services)
-    create_s6_services(s6_overlay_path, *enabled_services)
+    create_s6_services(
+        s6_overlay_path, *(set(enabled_services) | set(dependency_services))
+    )

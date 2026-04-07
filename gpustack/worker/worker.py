@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import logging
 from typing import Optional, Tuple
 import json
+import os
 
 import aiohttp
 from fastapi import FastAPI
@@ -153,6 +154,8 @@ class Worker:
             clientset_getter=self.clientset,
         )
 
+        migrate_worker_name(cfg)
+
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(10),
         wait=tenacity.wait_fixed(3),
@@ -161,9 +164,9 @@ class Worker:
             f"Retrying to get worker ID (attempt {retry_state.attempt_number}) due to: {retry_state.outcome.exception()}"
         ),
     )
-    def _register(self):
+    async def _register(self):
         self._clientset, self._default_config = (
-            self._worker_manager.register_with_server()
+            await self._worker_manager.register_with_server()
         )
         # Worker ID is available after the worker registration.
         worker_list = self._clientset.workers.list(
@@ -235,7 +238,10 @@ class Worker:
 
         add_signal_handlers_in_loop()
 
-        self._register()
+        # Check version compatibility with server before registration
+        await self._worker_manager.check_server_version()
+
+        await self._register()
         self._config.reload_worker_config(self._default_config)
         self.log_worker_config()
         if self._exporter_enabled:
@@ -453,3 +459,35 @@ class Worker:
                 )
         except Exception as e:
             logger.error(f"Failed to send heartbeat to server: {e}")
+
+
+def migrate_worker_name(cfg: Config):
+    """
+    Based on the situation that registration of worker changed in version v2.0, v2.1, we need to
+    recreate the worker_name file doesn't exist. Following are the files involved in the migration:
+
+    |  File Name   | < v0.7 | ~ v0.7 | ~ v2.0 | ~ v2.1 |
+    | ------------ | ------ | ------ | ------ | ------ |
+    | worker_name  |    Y   |    Y   |   Opt  |   YS   |
+    | worker_uuid  |        |    Y   |   Opt  |   YS   |
+    | worker_token |        |        |   YS   |   YS   |
+
+
+    Y means the file must exist and the content is generated locally.
+    Opt means the file may exist depends on the startup configuration.
+    YS means the file must exist and the content is generated from server.
+
+    When upgrading from v2.0 to v2.1, if the worker_name file doesn't exist, we need to migrate
+    the worker_name from configuration to the worker_name file. This is because in v2.0, the worker_name won't be written
+    to file if the worker is started with `--worker-name` argument or `GPUSTACK_WORKER_NAME` environment variable.
+
+    In the end, we can generate the worker_name file based on the existance of the worker_token file and the worker_name configuration.
+    """
+    worker_name_file = os.path.join(cfg.data_dir, "worker_name")
+    worker_token_file = os.path.join(cfg.data_dir, "worker_token")
+    if not os.path.exists(worker_name_file) and os.path.exists(worker_token_file):
+        if cfg.worker_name:
+            with open(worker_name_file, "w") as f:
+                f.write(cfg.worker_name)
+        else:
+            raise RuntimeError("worker_name not found for v2.0 upgrade")

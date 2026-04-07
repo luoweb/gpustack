@@ -1,25 +1,43 @@
+# Project information
 site_name: GPUStack
 site_url: https://docs.gpustack.ai
+site_author: GPUStack.ai
+site_description: >-
+  GPUStack is an open-source GPU cluster manager designed for efficient AI model deployment.
+  It lets you run models efficiently on your own GPU hardware by choosing the best inference engines,
+  scheduling GPU resources, analyzing model architectures, and automatically configuring deployment parameters.
+
+# Repository
+repo_name: gpustack/gpustack
+repo_url: https://github.com/gpustack/gpustack
+
+# Copyright
+copyright: Copyright &copy; 2026 GPUStack.ai
+
 theme:
   name: material
   logo: assets/logo-white.png
   favicon: assets/logo.png
   custom_dir: docs/overrides
   palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
     - media: "(prefers-color-scheme: light)"
       scheme: default
       primary: custom
       accent: orange
       toggle:
-        icon: material/lightbulb
+        icon: material/brightness-7
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
       primary: light blue
       accent: orange
       toggle:
-        icon: material/lightbulb-outline
-        name: Switch to light mode
+        icon: material/brightness-4
+        name: Switch to system preference
   features:
     - search.suggest
     - search.highlight
@@ -33,8 +51,13 @@ theme:
     - content.code.select
     - content.action.view
     - content.action.edit
+    - navigation.top
+    - navigation.footer
+    - navigation.tracking
+    - search.share
+    - toc.follow
   icon:
-    repo: fontawesome/brands/github-alt
+    repo: fontawesome/brands/github
   language: en
 plugins:
   - glightbox
@@ -49,23 +72,54 @@ plugins:
         'installation/iluvatar/installation.md': 'installation/requirements.md'
         'installation/cambricon/installation.md': 'installation/requirements.md'
         'installation/metax/installation.md': 'installation/requirements.md'
+  - minify:
+      minify_html: true
+      minify_css: true
+      minify_js: true
+      cache_safe: true
+      htmlmin_opts:
+        remove_comments: true
 extra:
   generator: false
   version:
     provider: mike
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/gpustack
+    - icon: fontawesome/brands/docker
+      link: https://hub.docker.com/r/gpustack
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/gpustack/
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/QAzGncGs
+    - icon: fontawesome/brands/weixin
+      link: https://github.com/gpustack/gpustack/blob/main/docs/assets/wechat-group-qrcode.jpg
 extra_javascript:
-  - javascripts/katex.js
   - image-selector/assets/extra.js
   - https://unpkg.com/katex@0/dist/katex.min.js
+  - javascripts/katex.js
   - https://unpkg.com/katex@0/dist/contrib/auto-render.min.js
+  - https://unpkg.com/tablesort@5.3.0/dist/tablesort.min.js
+  - javascripts/tablesort.js
 extra_css:
   - stylesheets/extra.css
   - https://unpkg.com/katex@0/dist/katex.min.css
 markdown_extensions:
+  - abbr
+  - def_list
   - attr_list
   - md_in_html
-  - pymdownx.highlight
-  - pymdownx.superfences
+  - pymdownx.highlight:
+      linenums: true
+      line_spans: __span
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       alternate_style: true
   - admonition
@@ -74,18 +128,24 @@ markdown_extensions:
   - pymdownx.tilde
   - pymdownx.betterem
   - pymdownx.caret
-  - pymdownx.inlinehilite
   - pymdownx.tasklist:
       custom_checkbox: true
   - pymdownx.arithmatex:
       generic: true
-repo_url: https://github.com/gpustack/gpustack
+  - pymdownx.emoji:
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+  - pymdownx.critic
+  - pymdownx.keys
+  - pymdownx.snippets:
+      auto_append:
+        - docs/includes/abbreviations.md
 edit_uri: edit/main/docs/
 nav:
   - Home:
       - Overview: overview.md
       - Quickstart: quickstart.md
-      - Installation: 
+      - Installation:
           - Requirements: installation/requirements.md
           - Installation: installation/installation.md
           - Air-Gapped Installation: installation/air-gapped.md
@@ -156,6 +216,10 @@ nav:
   - Inference Performance Lab:
       - Overview: performance-lab/overview.md
       - Optimizing Throughput:
+          - Qwen3.5-35B-A3B:
+              - H200: performance-lab/qwen3.5-35b-a3b/h200.md
+          - Qwen3.5-9B:
+              - H100: performance-lab/qwen3.5-9b/h100.md
           - GLM-4.5-Air:
               - A100: performance-lab/glm-4.5-air/a100.md
               - H100: performance-lab/glm-4.5-air/h100.md
@@ -187,6 +251,10 @@ nav:
               - A100: performance-lab/qwen3-235b-a22b/a100.md
               - H100: performance-lab/qwen3-235b-a22b/h100.md
       - Optimizing Latency:
+          - Qwen3.5-35B-A3B:
+              - H200: performance-lab/qwen3.5-35b-a3b/h200-latency.md
+          - Qwen3.5-9B:
+              - H100: performance-lab/qwen3.5-9b/h100-latency.md
           - Qwen3-8B:
               - H100: performance-lab/qwen3-8b/h100-latency.md
       - References:
